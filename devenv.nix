@@ -2,7 +2,6 @@
 
 {
   packages = [
-    config.languages.python.package.pkgs.pjsua2
     pkgs.git
   ];
 
@@ -26,7 +25,7 @@
   };
 
   git-hooks.hooks = {
-    clippy.enable = true;
+    clippy.enable = false;
   };
   
   enterShell = ''

@@ -4,6 +4,8 @@ import markdown.htmlparser
 import markdown
 from requests import get, post, put, delete
 import json
+import re
+from copy import deepcopy
 import sys
 from time import sleep
 from os.path import exists, isfile
@@ -15,6 +17,32 @@ from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 import warnings
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+
+
+TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+
+
+def _add_missing_table_delimiters(text: str) -> str:
+    """Insert the '| --- |' row under table headers that lack one, so they render as tables."""
+    lines = text.splitlines()
+    fixed = []
+    for i, line in enumerate(lines):
+        fixed.append(line)
+        is_row = line.lstrip().startswith("|")
+        starts_table = is_row and (i == 0 or not lines[i - 1].lstrip().startswith("|"))
+        next_is_row = i + 1 < len(lines) and lines[i + 1].lstrip().startswith("|")
+        if starts_table and next_is_row and not TABLE_DELIMITER.match(lines[i + 1]):
+            columns = len(line.strip().strip("|").split("|"))
+            fixed.append("|" + " --- |" * columns)
+    return "\n".join(fixed)
+
+
+def markdown_to_html(message: str) -> str:
+    """Convert Markdown text, or the contents of a Markdown file path, to HTML (tables included)."""
+    if exists(message) and isfile(message):
+        with open(message, encoding="utf-8") as message_fh:
+            message = message_fh.read()
+    return markdown.markdown(_add_missing_table_delimiters(message.strip()), extensions=["tables"])
 
 
 class FreshService(BaseSettings):
@@ -438,25 +466,23 @@ class FreshService(BaseSettings):
             cls.list_templates()
             return
         
-        ticket_object = cls.FRESH_TEMPLATES["DEFAULT"]
+        ticket_object = deepcopy(cls.FRESH_TEMPLATES["DEFAULT"])
         ticket_object["workspace_id"] = cls.settings.FRESH_WORKSPACE_ID
         ticket_object["email"] = cls.settings.FRESH_DEFAULT_CONTACT_EMAIL
         ticket_object["cc_emails"].append(cls.settings.FRESH_DEFAULT_CONTACT_EMAIL)
         ticket_object["department_id"] = cls.settings.FRESH_DEFAULT_DEPT_ID
         ticket_object["group_id"] = cls.settings.FRESH_DEFAULT_GROUP_ID
         ticket_object["category"] = cls.settings.FRESH_DEFAULT_CATEGORY
+        ticket_object["subject"] = cls.settings.FRESH_DEFAULT_SUBJECT
 
-        ticket_object["subject"] = subject.strip() if subject else cls.settings.FRESH_DEFAULT_SUBJECT
-        
-        for key,value in cls.FRESH_TEMPLATES[template_name].items():
-            ticket_object.update({key:value})
+        ticket_object.update(deepcopy(cls.FRESH_TEMPLATES[template_name]))
 
-        if exists(message) and isfile(message):
-            with open(message) as message_fh:
-                ticket_object["description"] = markdown.markdown(message_fh.read().strip())
-        else:
-            ticket_object["description"] = markdown.markdown(message.strip())
-        
+        # An explicit subject wins over the template's subject
+        if subject and subject.strip():
+            ticket_object["subject"] = subject.strip()
+
+        ticket_object["description"] = markdown_to_html(message)
+
         if not ticket_object["description"].strip():
             raise ValueError("Missing ticket content: description")
         
@@ -481,12 +507,8 @@ class FreshService(BaseSettings):
             "body": ""
         }
 
-        if exists(message) and isfile(message):
-            with open(message) as message_fh:
-                note["body"] = markdown.markdown(message_fh.read().strip())
-        else:
-            note["body"] = markdown.markdown(message.strip())
-        
+        note["body"] = markdown_to_html(message)
+
         if not note["body"].strip():
             raise ValueError("Missing note content: body")
         
