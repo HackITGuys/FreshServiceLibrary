@@ -1,25 +1,58 @@
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[tool.pytest.ini_options]
-addopts = "--cov=FreshService"
-testpaths = [
-    "tests",
+[project]
+name = "freshservice-library"
+version = "1.0.1"
+description = "Python bindings and CLI for the Freshservice API v2: tickets, service requests, changes, solution articles, announcements, alerts, assets and software"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "click>=8.1",
+    "markdown>=3.6",
+    "packaging>=24.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.7",
+    "requests>=2.32",
 ]
 
+[project.scripts]
+freshservice = "FreshService.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "responses>=0.25",
+    "ruff>=0.5",
+    "types-markdown",
+    "types-requests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/FreshService"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = [
+    "live: read-only calls to a real Freshservice account; needs a .env (pytest -m live)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+# N999: the import name is CamelCase on purpose, matching the NinjaOne library.
+ignore = ["N999"]
+
 [tool.mypy]
-mypy_path = "source"
-check_untyped_defs = true
-disallow_any_generics = true
-ignore_missing_imports = true
-no_implicit_optional = true
-show_error_codes = true
-strict_equality = true
-warn_redundant_casts = true
-warn_return_any = true
-warn_unreachable = true
-warn_unused_configs = true
-no_implicit_reexport = true
-
-
+python_version = "3.12"
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+strict = true

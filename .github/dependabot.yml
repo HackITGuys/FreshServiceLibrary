@@ -1,11 +1,36 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
+# Weekly dependency updates, Monday night, grouped into as few PRs as possible.
+# Security-alert PRs are enabled separately: Settings -> Code security -> Dependabot security updates.
+# Dependabot cannot update devenv.lock (Nix); run `devenv update` for that.
 version: 2
+
 updates:
-  - package-ecosystem: "pip" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: uv
+    directory: /
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+      time: "23:00"
+      timezone: Europe/Oslo
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      python-major:
+        patterns: ["*"]
+        update-types: [major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "23:00"
+      timezone: Europe/Oslo
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

@@ -1,6 +1,0 @@
-pydantic
-pydantic-settings
-typing
-markdown
-bs4
-requests
