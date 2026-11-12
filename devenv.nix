@@ -9,7 +9,7 @@
 
   languages.python = {
     enable = true;
-    version = "3.14";
+    package = pkgs.python314;
     directory = "./";
     venv = {
       enable = true;
