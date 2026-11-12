@@ -16,8 +16,8 @@ from typing import Any
 
 from FreshService._util import drop_none, workspace
 from FreshService.assets import asset_type_tree, asset_url, assets_by_display_id
-from FreshService.catalog import list_vendors
-from FreshService.client import FreshServiceAuthError, FreshServiceClient
+from FreshService.catalog import get_vendor, list_vendors
+from FreshService.client import FreshServiceAuthError, FreshServiceClient, FreshServiceNotFoundError
 from FreshService.matching import text_matches, version_key, version_matches, version_specifier
 from FreshService.models import (
     Asset,
@@ -25,6 +25,7 @@ from FreshService.models import (
     DeviceSoftware,
     Installation,
     InstallSummary,
+    Publisher,
     Software,
     SoftwareLicense,
     SoftwareUser,
@@ -46,29 +47,45 @@ def _chunks(values: Sequence[int], size: int = ID_CHUNK) -> list[list[int]]:
 # -- software entries ----------------------------------------------------------------
 
 
+def publisher_ids(vendors: Iterable[Vendor], publisher: str | int) -> set[int]:
+    """The vendor ids a publisher filter selects: an id, else a name substring or glob."""
+    text = str(publisher).strip()
+    pool = list(vendors)
+    if text.isdigit() and any(item.id == int(text) for item in pool):
+        return {int(text)}
+    return {item.id for item in pool if text_matches(item.name, text)}
+
+
 def list_software(
     client: FreshServiceClient,
     *,
-    vendor: str | None = None,
+    vendor: str | int | None = None,
     name: str | None = None,
     vendor_ids: Iterable[int] | None = None,
+    without_publisher: bool = False,
     status: str | None = None,
     vendors: Iterable[Vendor] | None = None,
     workspace_id: int | None = None,
 ) -> list[Software]:
-    """Software entries, filtered by vendor name (substring/glob), vendor ids, name and status.
+    """Software entries with `publisher_name` filled in, filtered by publisher, name and status.
 
-    Pass `vendors` (from list_vendors) to avoid fetching them again for the vendor filter.
-    status "none" selects entries with no status (not yet triaged).
+    vendor: the publisher's id, or a name substring/glob ("google" matches "Google" and
+    "Google LLC"). vendor_ids: exact publisher ids. without_publisher: only entries with no
+    publisher, or one that no longer exists. status "none": entries not yet triaged.
+    Pass `vendors` (from list_vendors) to avoid fetching them again.
     """
+    pool = list(vendors) if vendors is not None else list_vendors(client)
+    names = {item.id: item.name for item in pool}
     params = drop_none({"workspace_id": workspace(client, workspace_id)})
     entries = [
         Software.model_validate(raw) for raw in client.paginate("/applications", SOFTWARE_KEYS, params)
     ]
+    for entry in entries:
+        entry.publisher_name = names.get(entry.publisher_id) if entry.publisher_id is not None else None
+
     ids: set[int] | None = set(vendor_ids) if vendor_ids is not None else None
-    if vendor:
-        pool = list(vendors) if vendors is not None else list_vendors(client)
-        matched = {item.id for item in pool if text_matches(item.name, vendor)}
+    if vendor is not None and str(vendor).strip():
+        matched = publisher_ids(pool, vendor)
         ids = matched if ids is None else ids & matched
 
     def status_ok(entry: Software) -> bool:
@@ -81,12 +98,59 @@ def list_software(
     return [
         entry
         for entry in entries
-        if (ids is None or entry.publisher_id in ids) and text_matches(entry.name, name) and status_ok(entry)
+        if (ids is None or entry.publisher_id in ids)
+        and (not without_publisher or entry.publisher_name is None)
+        and text_matches(entry.name, name)
+        and status_ok(entry)
     ]
 
 
+def list_publishers(
+    client: FreshServiceClient,
+    *,
+    name: str | None = None,
+    include_unassigned: bool = True,
+    software: Iterable[Software] | None = None,
+    vendors: Iterable[Vendor] | None = None,
+) -> list[Publisher]:
+    """The vendors that publish at least one software entry, most entries first (the
+    unassigned row last).
+
+    name: publisher name substring or glob. include_unassigned: add one row (id None) for
+    the entries with no publisher, or one that no longer exists. Pass `software`/`vendors`
+    you already have to skip fetching them.
+    """
+    pool = list(vendors) if vendors is not None else list_vendors(client)
+    entries = list(software) if software is not None else list_software(client, vendors=pool)
+    names = {item.id: item.name for item in pool}
+    grouped: dict[int | None, list[Software]] = defaultdict(list)
+    for entry in entries:
+        key = entry.publisher_id if entry.publisher_id in names else None
+        grouped[key].append(entry)
+    publishers = [
+        Publisher(
+            id=publisher_id,
+            name=names.get(publisher_id) if publisher_id is not None else None,
+            software_count=len(members),
+            installation_count=sum(member.installation_count or 0 for member in members),
+            user_count=sum(member.user_count or 0 for member in members),
+        )
+        for publisher_id, members in grouped.items()
+        if (publisher_id is not None and text_matches(names.get(publisher_id), name))
+        or (publisher_id is None and include_unassigned and not name)
+    ]
+    return sorted(publishers, key=lambda p: (p.id is None, -p.software_count, (p.name or "").casefold()))
+
+
 def get_software(client: FreshServiceClient, software_id: int) -> Software:
-    return Software.model_validate(client.get_object(f"/applications/{software_id}", "application"))
+    """One software entry, with publisher_name filled in."""
+    entry = Software.model_validate(client.get_object(f"/applications/{software_id}", "application"))
+    if entry.publisher_id is not None:
+        try:
+            entry.publisher_name = get_vendor(client, entry.publisher_id).name
+        except FreshServiceNotFoundError:
+            entry.publisher_name = None
+    return entry
 
 
 def create_software(
@@ -194,7 +258,7 @@ def list_licenses(client: FreshServiceClient, software_id: int) -> list[Software
 def where_installed(
     client: FreshServiceClient,
     *,
-    vendor: str | None = None,
+    vendor: str | int | None = None,
     name: str | None = None,
     version: str | None = None,
     software: Iterable[Software] | None = None,
@@ -203,9 +267,9 @@ def where_installed(
 ) -> list[DeviceInstall]:
     """Every installation of the matching software, joined with its vendor and device.
 
-    vendor and name are substrings or globs; version is exact, a glob or a PEP 440 range
-    ("<24.09"). Pass `software` to skip the software listing, `assets` (by display_id) to
-    skip fetching devices you already have.
+    vendor is the publisher's id or a name substring/glob, name a substring or glob;
+    version is exact, a glob or a PEP 440 range ("<24.09"). Pass `software` to skip the
+    software listing, `assets` (by display_id) to skip fetching devices you already have.
     """
     if version:
         version_specifier(version)  # fail on a bad specifier before any API call

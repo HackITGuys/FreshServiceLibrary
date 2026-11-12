@@ -4,7 +4,7 @@ Python bindings and a CLI for the [Freshservice](https://www.freshworks.com/fres
 
 - **Service desk:** tickets and service requests (create, update, notes, replies, attachments), the service catalog, changes and change notes, solution articles (create, update, publish, "mine"), announcements and alerts.
 - **People:** agents, groups, roles, departments and locations.
-- **Assets and software:** assets and asset types, devices, products, vendors and software, plus "where is this software installed" by vendor, name and version.
+- **Assets and software:** assets and asset types, devices, products, vendors and software (each entry carries its publisher's name), the list of software publishers, plus "where is this software installed" by publisher, name and version.
 - **Clean-up:** placeholder ("Unknown") product and vendor for assets that have none, setting the real product and vendor later, merging duplicate vendors, merging software within one vendor, and deleting unused software. Each of these is planned first and only written with `--apply`.
 
 ## Install
@@ -91,7 +91,7 @@ with FreshServiceClient() as client:
 | Org | `list_agents`, `get_agent`, `resolve_agent`, `list_groups`, `list_roles`, `list_departments`, `list_locations` |
 | Assets | `list_assets`, `list_devices`, `get_asset`, `update_asset`, `set_asset_product_vendor`, `delete_asset`, `assets_by_display_id`, `list_asset_types`, `asset_type_tree`, `asset_type_fields`, `product_vendor_fields` |
 | Products / vendors | `list_products`, `get/create/update/delete_product`, `list_vendors`, `get/create/update/delete_vendor`, `find_or_create_product`, `find_or_create_vendor`, `list_contracts` |
-| Software | `list_software`, `get/create/update/delete_software`, `list_installations`, `add_installation`, `remove_installations`, `list_software_users`, `add_software_users`, `remove_software_users`, `list_licenses`, `where_installed`, `summarise_installs`, `by_device` |
+| Software | `list_software`, `list_publishers`, `get/create/update/delete_software`, `list_installations`, `add_installation`, `remove_installations`, `list_software_users`, `add_software_users`, `remove_software_users`, `list_licenses`, `where_installed`, `summarise_installs`, `by_device` |
 | Clean-up | `plan_tag_unknown`, `plan_set_product_vendor`, `plan_vendor_merge`, `plan_software_merge`, `plan_software_delete`, `apply_plan` |
 
 Bodies (`description`, `body`, `body_html`) are HTML and sent as given; call `markdown_to_html()` first for Markdown. Attachments are local file paths; with any, the request goes as multipart. For anything not wrapped, `client.get(path)`, `client.paginate(path, key)`, `client.post/put/delete` give you raw JSON with auth, retries and paging handled.
@@ -126,7 +126,10 @@ freshservice announcements create --title "Email outage" --body "Back by 14:00" 
 freshservice alerts list --severity critical --state open --since 2026-11-01
 freshservice org groups
 freshservice assets devices
-freshservice software where --vendor Mozilla --name Firefox --version "<128" --summary
+freshservice software publishers                         # vendors that publish software, with counts
+freshservice software list --publisher Mozilla           # by name (substring/glob) or id; publisher_name filled in
+freshservice software list --no-publisher                # entries with no (existing) publisher
+freshservice software where --publisher Mozilla --name Firefox --version "<128" --summary
 ```
 
 Global options: `--env-file`, `-o/--output FILE`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines) and `-v`. Single deletes ask for confirmation unless `--yes` is given.

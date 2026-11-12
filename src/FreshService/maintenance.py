@@ -432,7 +432,7 @@ def plan_vendor_merge(
     build = _Builder("vendor-merge")
     depends: dict[int, list[int]] = defaultdict(list)
 
-    software = [entry for entry in list_software(client) if entry.publisher_id in source_ids]
+    software = [entry for entry in list_software(client, vendors=vendors) if entry.publisher_id in source_ids]
     for entry in software:
         assert entry.publisher_id is not None
         depends[entry.publisher_id].append(
@@ -544,7 +544,7 @@ def plan_software_merge(
     """
     vendors = list_vendors(client)
     owner = _one_vendor(vendors, vendor)
-    entries = list_software(client, vendor_ids=[owner.id])
+    entries = list_software(client, vendor_ids=[owner.id], vendors=vendors)
     by_id = {entry.id: entry for entry in entries}
     build = _Builder("software-merge")
     build.warn(REDISCOVERY_WARNING)

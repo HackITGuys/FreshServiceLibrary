@@ -1656,14 +1656,43 @@ def software() -> None:
     """Software: entries, installations, where-installed, merges and cleanup."""
 
 
+publisher_option = click.option(
+    "--publisher",
+    "--vendor",
+    "vendor",
+    help="Publisher (vendor) id, or name substring or glob (see `software publishers`).",
+)
+
+
 @software.command("list")
-@click.option("--vendor", help="Vendor name substring or glob.")
+@publisher_option
+@click.option("--no-publisher", is_flag=True, help="Only entries with no (existing) publisher.")
 @click.option("--name", help="Name substring or glob.")
 @click.option("--status", help="managed, ignored, blacklisted or none.")
 @pass_state
-def software_list(state: State, vendor: str | None, name: str | None, status: str | None) -> None:
-    """List software entries."""
-    emit(state, software_api.list_software(state.client, vendor=vendor, name=name, status=status))
+def software_list(
+    state: State, vendor: str | None, no_publisher: bool, name: str | None, status: str | None
+) -> None:
+    """List software entries, with publisher_name filled in."""
+    if vendor and no_publisher:
+        raise click.UsageError("--publisher or --no-publisher, not both")
+    emit(
+        state,
+        software_api.list_software(
+            state.client, vendor=vendor, without_publisher=no_publisher, name=name, status=status
+        ),
+    )
+
+
+@software.command("publishers")
+@click.option("--name", help="Publisher name substring or glob.")
+@click.option(
+    "--no-unassigned", is_flag=True, help="Leave out the row for entries with no (existing) publisher."
+)
+@pass_state
+def software_publishers(state: State, name: str | None, no_unassigned: bool) -> None:
+    """Vendors that publish software, with entry, installation and user counts."""
+    emit(state, software_api.list_publishers(state.client, name=name, include_unassigned=not no_unassigned))
 
 
 @software.command("get")
@@ -1719,7 +1748,7 @@ def software_update(
 
 
 @software.command("where")
-@click.option("--vendor", help="Vendor name substring or glob.")
+@publisher_option
 @click.option("--name", help="Software name substring or glob.")
 @click.option("--version", help='Exact, glob ("24.*") or range ("<24.09").')
 @click.option("--summary", is_flag=True, help="Per software: device counts per version.")
@@ -1730,7 +1759,7 @@ def software_where(
 ) -> None:
     """Every device with the matching software installed."""
     if not (vendor or name):
-        raise click.UsageError("Give --vendor and/or --name (all software would be one call per entry)")
+        raise click.UsageError("Give --publisher and/or --name (all software would be one call per entry)")
     if summary and by_device:
         raise click.UsageError("--summary or --by-device, not both")
     installs = software_api.where_installed(state.client, vendor=vendor, name=name, version=version)

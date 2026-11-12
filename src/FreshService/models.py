@@ -699,6 +699,9 @@ class Software(ApiModel):
     """managed, ignored, blacklisted (or empty: not yet triaged)."""
     publisher_id: int | None = None
     """The vendor id."""
+    publisher_name: str | None = None
+    """The publisher's (vendor's) name. Not an API field: the library fills it in from
+    publisher_id. None when there is no publisher, or the id names no existing vendor."""
     managed_by_id: int | None = None
     category: str | None = None
     notes: str | None = None
@@ -708,6 +711,19 @@ class Software(ApiModel):
     workspace_id: int | None = None
     created_at: Timestamp = None
     updated_at: Timestamp = None
+
+
+class Publisher(BaseModel):
+    """A vendor that publishes software entries, with how many and how widely installed.
+    id and name are None for the entries with no (existing) publisher."""
+
+    id: int | None
+    name: str | None
+    software_count: int
+    installation_count: int
+    """Sum of the entries' installation_count."""
+    user_count: int
+    """Sum of the entries' user_count."""
 
 
 class Installation(ApiModel):

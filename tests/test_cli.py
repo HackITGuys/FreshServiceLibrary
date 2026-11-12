@@ -103,7 +103,7 @@ def test_bulk_commands_plan_unless_apply(client: FreshServiceClient, api: respon
     ("args", "message"),
     [
         (["articles", "list"], "exactly one of"),
-        (["software", "where"], "--vendor and/or --name"),
+        (["software", "where"], "--publisher and/or --name"),
         (["tickets", "update", "1"], "Nothing to change"),
     ],
 )
@@ -116,3 +116,29 @@ def test_api_errors_are_one_line(client: FreshServiceClient, api: responses.Requ
     assert "Error: GET /api/v2/tickets/404 returned HTTP 404: No ticket" in fail(
         client, "tickets", "get", "404"
     )
+
+
+def test_software_publishers_and_list_by_publisher(
+    client: FreshServiceClient, api: responses.RequestsMock
+) -> None:
+    pages(api, "/vendors", "vendors", [{"id": 10, "name": "Mozilla"}, {"id": 11, "name": "Google"}])
+    pages(
+        api,
+        "/applications",
+        "applications",
+        [
+            {"id": 1, "name": "Firefox", "publisher_id": 10, "installation_count": 5},
+            {"id": 2, "name": "Chrome", "publisher_id": 11},
+            {"id": 3, "name": "Mystery"},
+        ],
+    )
+    publishers = run(client, "software", "publishers", "--no-unassigned")
+    assert [(p["name"], p["software_count"], p["installation_count"]) for p in publishers] == [
+        ("Google", 1, 0),
+        ("Mozilla", 1, 5),
+    ]
+    by_publisher = run(client, "software", "list", "--publisher", "Mozilla")
+    assert [(s["id"], s["publisher_name"]) for s in by_publisher] == [(1, "Mozilla")]
+    assert [s["id"] for s in run(client, "software", "list", "--vendor", "11")] == [2]
+    assert [s["id"] for s in run(client, "software", "list", "--no-publisher")] == [3]
+    assert "not both" in fail(client, "software", "list", "--publisher", "x", "--no-publisher")

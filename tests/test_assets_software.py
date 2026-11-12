@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import responses
 
@@ -7,9 +9,11 @@ from FreshService import (
     FreshServiceClient,
     asset_type_tree,
     by_device,
+    get_software,
     list_assets,
     list_devices,
     list_my_articles,
+    list_publishers,
     list_software,
     product_vendor_fields,
     summarise_installs,
@@ -59,15 +63,60 @@ def test_list_assets_by_type_filters_the_full_listing(
     assert [a.name for a in list_devices(client)] == ["fw01", "pc01", "sw01"]  # default: Hardware
 
 
-def test_list_software_filters(client: FreshServiceClient, api: responses.RequestsMock) -> None:
-    pages(api, "/applications", "applications", SOFTWARE)
-    assert [s.id for s in list_software(client, vendor="google*", vendors=[])] == []
-    from FreshService import Vendor
+def ids(entries: list[Any]) -> list[int]:
+    return [entry.id for entry in entries]
 
-    vendors = [Vendor.model_validate(v) for v in VENDORS]
-    assert [s.id for s in list_software(client, vendor="google*", vendors=vendors)] == [102]
-    assert [s.id for s in list_software(client, name="mozilla", vendors=vendors)] == [100, 101]
-    assert [s.id for s in list_software(client, status="none")] == [100, 101, 102, 103]
+
+def register_software(api: responses.RequestsMock) -> None:
+    pages(api, "/vendors", "vendors", VENDORS)
+    orphan = {"id": 104, "name": "Orphan", "publisher_id": 77, "installation_count": 2, "user_count": 1}
+    pages(api, "/applications", "applications", [*SOFTWARE, orphan])
+
+
+def test_list_software_fills_in_and_filters_by_publisher(
+    client: FreshServiceClient, api: responses.RequestsMock
+) -> None:
+    register_software(api)
+    entries = {entry.id: entry for entry in list_software(client)}
+    assert entries[100].publisher_name == "Mozilla" and entries[102].publisher_name == "Google LLC"
+    assert entries[103].publisher_name is None  # no publisher
+    assert entries[104].publisher_name is None  # publisher 77 no longer exists
+    assert entries[100].model_dump(mode="json")["publisher_name"] == "Mozilla"
+
+    assert ids(list_software(client, vendor="google")) == [102]  # "Google" and "Google LLC"
+    assert ids(list_software(client, vendor="Google*")) == [102]
+    assert ids(list_software(client, vendor=10)) == [100, 101]
+    assert ids(list_software(client, vendor="10")) == [100, 101]
+    assert ids(list_software(client, vendor=12)) == []
+    assert ids(list_software(client, without_publisher=True)) == [103, 104]
+    assert ids(list_software(client, vendor="mozilla", name="thunder")) == [101]
+    assert ids(list_software(client, status="none")) == [100, 101, 102, 103, 104]
+    assert ids(list_software(client, vendor="google", vendors=[])) == []
+
+
+def test_list_publishers(client: FreshServiceClient, api: responses.RequestsMock) -> None:
+    register_software(api)
+    rows = [
+        (p.id, p.name, p.software_count, p.installation_count, p.user_count) for p in list_publishers(client)
+    ]
+    assert rows == [
+        (10, "Mozilla", 2, 3, 0),
+        (11, "Google LLC", 1, 1, 0),
+        (None, None, 2, 2, 1),  # 103 (no publisher) and 104 (deleted publisher), always last
+    ]
+    assert [p.name for p in list_publishers(client, name="goog")] == [
+        "Google LLC"
+    ]  # "Google" publishes nothing
+    assert None not in [p.id for p in list_publishers(client, include_unassigned=False)]
+
+
+def test_get_software_fills_in_the_publisher(client: FreshServiceClient, api: responses.RequestsMock) -> None:
+    get(api, "/applications/100", {"application": {"id": 100, "name": "Mozilla Firefox", "publisher_id": 10}})
+    get(api, "/vendors/10", {"vendor": {"id": 10, "name": "Mozilla"}})
+    get(api, "/applications/104", {"application": {"id": 104, "name": "Orphan", "publisher_id": 77}})
+    api.get(API + "/vendors/77", status=404)
+    assert get_software(client, 100).publisher_name == "Mozilla"
+    assert get_software(client, 104).publisher_name is None
 
 
 def test_where_installed_joins_devices(client: FreshServiceClient, api: responses.RequestsMock) -> None:
