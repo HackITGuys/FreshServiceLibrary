@@ -21,11 +21,13 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TextIO, TypeVar
 
 import click
 import requests
@@ -36,13 +38,13 @@ from FreshService import announcements as announcements_api
 from FreshService import assets as assets_api
 from FreshService import catalog as catalog_api
 from FreshService import changes as changes_api
-from FreshService import maintenance
+from FreshService import maintenance, views
 from FreshService import org as org_api
 from FreshService import service_requests as requests_api
 from FreshService import software as software_api
 from FreshService import solutions as solutions_api
 from FreshService import tickets as tickets_api
-from FreshService.client import FreshServiceClient, FreshServiceError
+from FreshService.client import FreshServiceClient, FreshServiceError, FreshServiceNotFoundError
 from FreshService.config import FreshServiceSettings
 from FreshService.formatting import markdown_to_html
 from FreshService.models import (
@@ -55,6 +57,7 @@ from FreshService.models import (
     Priority,
     Risk,
     TicketStatus,
+    Vendor,
     code,
 )
 
@@ -63,12 +66,66 @@ log = logging.getLogger("FreshService")
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def _records(count: int) -> str:
+    return f"{count:,} record" + ("" if count == 1 else "s")
+
+
+class StderrProgress:
+    """One live status line on stderr: "applications: 3,400 records", "installations: 34/120".
+
+    Updates are throttled; the line is cleared before anything else is printed.
+    """
+
+    INTERVAL = 0.1
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self.stream = stream if stream is not None else sys.stderr
+        self._shown = False
+        self._last = 0.0
+        self._label = ""
+        self._lock = threading.Lock()
+
+    def __call__(self, label: str, done: int, total: int | None) -> None:
+        now = time.monotonic()
+        with self._lock:
+            final = total is not None and done >= total
+            if not final and label == self._label and now - self._last < self.INTERVAL:
+                return
+            self._last, self._label = now, label
+            text = f"{label}: {done:,}/{total:,}" if total is not None else f"{label}: {_records(done)}"
+            self.stream.write("\r\033[K" + text + "...")
+            self.stream.flush()
+            self._shown = True
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._shown:
+                self.stream.write("\r\033[K")
+                self.stream.flush()
+                self._shown = False
+
+
+class _ProgressAwareHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """Log lines clear the progress line first, so they don't print over it."""
+
+    def __init__(self, progress: StderrProgress | None) -> None:
+        super().__init__(sys.stderr)
+        self.progress = progress
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.progress is not None:
+            self.progress.clear()
+        super().emit(record)
+
+
 @dataclass
 class State:
     env_file: Path | None = None
     output: Path | None = None
     compact: bool = False
+    json_output: bool = False
     audit_log: Path | None = None
+    progress: StderrProgress | None = None
     _client: FreshServiceClient | None = field(default=None, repr=False)
 
     @property
@@ -77,27 +134,48 @@ class State:
             settings = (
                 FreshServiceSettings(_env_file=self.env_file) if self.env_file else FreshServiceSettings()
             )
-            self._client = FreshServiceClient(settings, audit_log=self.audit_log)
+            self._client = FreshServiceClient(settings, audit_log=self.audit_log, progress=self.progress)
         return self._client
 
 
 pass_state = click.make_pass_decorator(State)
 
 
-def emit(state: State, data: Any) -> None:
-    """Models, lists of models and dicts of them -> JSON on stdout (or --output)."""
-    text = json.dumps(
-        to_jsonable_python(data, by_alias=False),
-        indent=None if state.compact else 2,
-        ensure_ascii=False,
-    )
+def emit(state: State, data: Any, *, table: bool = False) -> None:
+    """Models, lists of models and dicts of them -> stdout (or --output, always JSON).
+
+    table=True prints a list as aligned columns on stdout, unless --json is given.
+    """
+    payload = to_jsonable_python(data, by_alias=False)
+    if state.progress is not None:
+        state.progress.clear()
     if state.output:
+        text = json.dumps(payload, indent=None if state.compact else 2, ensure_ascii=False)
         state.output.parent.mkdir(parents=True, exist_ok=True)
         state.output.write_text(text + "\n", encoding="utf-8")
         count = f"{len(data)} records" if isinstance(data, list | dict) else "1 record"
         click.echo(f"Wrote {count} to {state.output}", err=True)
+    elif table and not state.json_output and isinstance(payload, list):
+        if payload:
+            click.echo(views.render_table(payload))
+        click.echo(_records(len(payload)), err=True)
     else:
-        click.echo(text)
+        click.echo(json.dumps(payload, indent=None if state.compact else 2, ensure_ascii=False))
+
+
+def show(state: State, brief: bool, records: Sequence[Any]) -> None:
+    """Full records as JSON, or with --brief only their identifying fields, as a table."""
+    if brief:
+        emit(state, views.brief(state.client, records), table=True)
+    else:
+        emit(state, records)
+
+
+brief_option = click.option(
+    "--brief",
+    is_flag=True,
+    help="Only the identifying fields (names, state, counts), as a table on screen. No extra API calls.",
+)
 
 
 # -- option helpers ---------------------------------------------------------------------
@@ -209,7 +287,12 @@ def confirm(yes: bool, what: str) -> None:
         click.confirm(f"Delete {what}?", abort=True, err=True)
 
 
-def run_plan(state: State, plan: MaintenancePlan, apply: bool) -> None:
+def run_plan(state: State, plan: MaintenancePlan, apply: bool, brief: bool = False) -> None:
+    """Print a maintenance plan, or apply it and print the outcome.
+
+    --brief prints the actions as a table (the summary goes to stderr); -o always writes the
+    full plan as JSON.
+    """
     for warning in plan.warnings:
         log.warning("%s", warning)
     if apply:
@@ -219,7 +302,20 @@ def run_plan(state: State, plan: MaintenancePlan, apply: bool) -> None:
             log.error("%s of %s actions failed; see their 'error'", failed, len(plan.actions))
     else:
         log.warning("Plan only: %d change(s). Run again with --apply to make them.", len(plan.actions))
-    emit(state, plan)
+    if brief and not state.output:
+        click.echo(f"summary: {json.dumps(to_jsonable_python(plan.summary), ensure_ascii=False)}", err=True)
+        rows = [
+            {"#": index, "action": a.action, "target": a.target, "status": a.status, "error": a.error}
+            for index, a in enumerate(plan.actions)
+        ]
+        emit(state, rows, table=True)
+    else:
+        emit(state, plan)
+
+
+plan_brief_option = click.option(
+    "--brief", is_flag=True, help="Print the actions as a table (action, target, status) instead of the plan."
+)
 
 
 class Group(click.Group):
@@ -245,12 +341,18 @@ class Group(click.Group):
     help="Write JSON here instead of stdout.",
 )
 @click.option("--compact", is_flag=True, help="One-line JSON.")
+@click.option("--json", "json_output", is_flag=True, help="Print JSON on stdout, never tables.")
 @click.option(
     "--audit-log",
     type=click.Path(path_type=Path, dir_okay=False),
     help="Append every POST/PUT/DELETE to this JSON-lines file.",
 )
-@click.option("-v", "--verbose", count=True, help="-v for progress, -vv for HTTP details.")
+@click.option(
+    "--progress/--no-progress",
+    default=None,
+    help="A live status line on stderr while fetching (default: on when stderr is a terminal).",
+)
+@click.option("-v", "--verbose", count=True, help="-v for more detail, -vv for HTTP details.")
 @click.version_option(package_name="freshservice-library")
 @click.pass_context
 def main(
@@ -258,23 +360,28 @@ def main(
     env_file: Path | None,
     output: Path | None,
     compact: bool,
+    json_output: bool,
     audit_log: Path | None,
+    progress: bool | None,
     verbose: int,
 ) -> None:
     """Freshservice API: tickets, requests, changes, articles, announcements, alerts, assets, software."""
+    show_progress = sys.stderr.isatty() if progress is None else progress
+    reporter = StderrProgress() if show_progress else None
+    handler = _ProgressAwareHandler(reporter)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
     logging.basicConfig(
-        stream=sys.stderr,
-        level=max(logging.DEBUG, logging.WARNING - 10 * verbose),
-        format="%(levelname)s %(message)s",
+        level=max(logging.DEBUG, logging.WARNING - 10 * verbose), handlers=[handler], force=True
     )
     if not isinstance(ctx.obj, State):
         ctx.obj = State()
-    ctx.obj.env_file, ctx.obj.output, ctx.obj.compact, ctx.obj.audit_log = (
-        env_file,
-        output,
-        compact,
-        audit_log,
-    )
+    state = ctx.obj
+    state.env_file, state.output, state.audit_log = env_file, output, audit_log
+    state.compact, state.json_output, state.progress = compact, json_output, reporter
+    if reporter is not None:
+        if state._client is not None:  # a client handed in (tests): report through it too
+            state._client.progress = reporter
+        ctx.call_on_close(reporter.clear)
 
 
 # -- tickets ------------------------------------------------------------------------------
@@ -305,9 +412,11 @@ def tickets_get(state: State, ticket_id: int, include: str | None) -> None:
 @click.option("--email", help="Requester email.")
 @click.option("--requester-id", type=int)
 @click.option("--type", "ticket_type", help='e.g. "Service Request" or "Incident".')
+@brief_option
 @pass_state
 def tickets_list(
     state: State,
+    brief: bool,
     since: date | None,
     predefined: str | None,
     email: str | None,
@@ -315,8 +424,9 @@ def tickets_list(
     ticket_type: str | None,
 ) -> None:
     """List tickets."""
-    emit(
+    show(
         state,
+        brief,
         tickets_api.list_tickets(
             state.client,
             predefined=predefined,
@@ -330,10 +440,11 @@ def tickets_list(
 
 @tickets.command("filter")
 @click.argument("query")
+@brief_option
 @pass_state
-def tickets_filter(state: State, query: str) -> None:
+def tickets_filter(state: State, brief: bool, query: str) -> None:
     """Tickets matching a filter query, e.g. "status:2 AND priority:>3"."""
-    emit(state, tickets_api.filter_tickets(state.client, query))
+    show(state, brief, tickets_api.filter_tickets(state.client, query))
 
 
 @tickets.command("fields")
@@ -598,13 +709,14 @@ def requests_categories(state: State) -> None:
 @service_requests.command("items")
 @click.option("--category-id", type=int)
 @click.option("--search", help="Search term instead of listing.")
+@brief_option
 @pass_state
-def requests_items(state: State, category_id: int | None, search: str | None) -> None:
+def requests_items(state: State, brief: bool, category_id: int | None, search: str | None) -> None:
     """Service catalog items."""
     if search:
-        emit(state, requests_api.search_catalog_items(state.client, search))
+        show(state, brief, requests_api.search_catalog_items(state.client, search))
     else:
-        emit(state, requests_api.list_catalog_items(state.client, category_id=category_id))
+        show(state, brief, requests_api.list_catalog_items(state.client, category_id=category_id))
 
 
 @service_requests.command("item")
@@ -682,9 +794,11 @@ def changes_get(state: State, change_id: int) -> None:
 @when_option("--since", help="Updated since.")
 @click.option("--order-by")
 @click.option("--order-type", type=click.Choice(["asc", "desc"]))
+@brief_option
 @pass_state
 def changes_list(
     state: State,
+    brief: bool,
     query: str | None,
     view: str | None,
     since: date | None,
@@ -692,8 +806,9 @@ def changes_list(
     order_type: str | None,
 ) -> None:
     """List changes."""
-    emit(
+    show(
         state,
+        brief,
         changes_api.list_changes(
             state.client,
             query=query,
@@ -941,9 +1056,16 @@ def articles_folders(state: State, category_id: int | None, top_level: bool) -> 
 @click.option("--author", help="Articles created by this agent (email or id).")
 @click.option("--all", "everything", is_flag=True, help="Every article.")
 @click.option("--status", type=click.Choice(["draft", "published"]))
+@brief_option
 @pass_state
 def articles_list(
-    state: State, folder_id: int | None, mine: bool, author: str | None, everything: bool, status: str | None
+    state: State,
+    brief: bool,
+    folder_id: int | None,
+    mine: bool,
+    author: str | None,
+    everything: bool,
+    status: str | None,
 ) -> None:
     """List articles: --folder ID, --mine, --author or --all (the last three walk every folder)."""
     if sum((folder_id is not None, mine, author is not None, everything)) != 1:
@@ -958,16 +1080,17 @@ def articles_list(
         found = solutions_api.list_my_articles(client, agent_id=int(author))
     else:
         found = solutions_api.list_my_articles(client, email=author)
-    emit(state, [article for article in found if wanted is None or article.status == wanted])
+    show(state, brief, [article for article in found if wanted is None or article.status == wanted])
 
 
 @articles.command("search")
 @click.argument("term")
 @click.option("--user-email", help="Search as this user (needs permission to assume them).")
+@brief_option
 @pass_state
-def articles_search(state: State, term: str, user_email: str | None) -> None:
+def articles_search(state: State, brief: bool, term: str, user_email: str | None) -> None:
     """Search published articles."""
-    emit(state, solutions_api.search_articles(state.client, term, user_email=user_email))
+    show(state, brief, solutions_api.search_articles(state.client, term, user_email=user_email))
 
 
 @articles.command("get")
@@ -1106,10 +1229,11 @@ def announcements() -> None:
 
 @announcements.command("list")
 @click.option("--state", "announcement_state", type=click.Choice(list(announcements_api.STATES)))
+@brief_option
 @pass_state
-def announcements_list(state: State, announcement_state: str | None) -> None:
+def announcements_list(state: State, brief: bool, announcement_state: str | None) -> None:
     """List announcements."""
-    emit(state, announcements_api.list_announcements(state.client, state=announcement_state))
+    show(state, brief, announcements_api.list_announcements(state.client, state=announcement_state))
 
 
 @announcements.command("get")
@@ -1240,9 +1364,11 @@ def alerts() -> None:
 @click.option("--integration-id", type=int)
 @click.option("--order-by", type=click.Choice(["updated_at", "occurrence_time", "severity", "state", "id"]))
 @click.option("--order-type", type=click.Choice(["asc", "desc"]))
+@brief_option
 @pass_state
 def alerts_list(
     state: State,
+    brief: bool,
     query: str | None,
     severity: tuple[str, ...],
     alert_state: tuple[str, ...],
@@ -1257,7 +1383,7 @@ def alerts_list(
         query = alerts_api.alert_query(
             severity=severity, state=alert_state, since=since, until=until, integration_id=integration_id
         )
-    emit(state, alerts_api.list_alerts(state.client, query, order_by=order_by, order_type=order_type))
+    show(state, brief, alerts_api.list_alerts(state.client, query, order_by=order_by, order_type=order_type))
 
 
 @alerts.command("get")
@@ -1287,10 +1413,11 @@ def org() -> None:
 @org.command("agents")
 @click.option("--email")
 @click.option("--active/--inactive", default=None)
+@brief_option
 @pass_state
-def org_agents(state: State, email: str | None, active: bool | None) -> None:
+def org_agents(state: State, brief: bool, email: str | None, active: bool | None) -> None:
     """List agents."""
-    emit(state, org_api.list_agents(state.client, email=email, active=active))
+    show(state, brief, org_api.list_agents(state.client, email=email, active=active))
 
 
 @org.command("me")
@@ -1307,31 +1434,35 @@ def org_me(state: State) -> None:
 
 
 @org.command("groups")
+@brief_option
 @pass_state
-def org_groups(state: State) -> None:
+def org_groups(state: State, brief: bool) -> None:
     """List agent groups."""
-    emit(state, org_api.list_groups(state.client))
+    show(state, brief, org_api.list_groups(state.client))
 
 
 @org.command("roles")
+@brief_option
 @pass_state
-def org_roles(state: State) -> None:
+def org_roles(state: State, brief: bool) -> None:
     """List agent roles."""
-    emit(state, org_api.list_roles(state.client))
+    show(state, brief, org_api.list_roles(state.client))
 
 
 @org.command("departments")
+@brief_option
 @pass_state
-def org_departments(state: State) -> None:
+def org_departments(state: State, brief: bool) -> None:
     """List departments."""
-    emit(state, org_api.list_departments(state.client))
+    show(state, brief, org_api.list_departments(state.client))
 
 
 @org.command("locations")
+@brief_option
 @pass_state
-def org_locations(state: State) -> None:
+def org_locations(state: State, brief: bool) -> None:
     """List locations."""
-    emit(state, org_api.list_locations(state.client))
+    show(state, brief, org_api.list_locations(state.client))
 
 
 # -- assets -----------------------------------------------------------------------------------
@@ -1357,6 +1488,7 @@ type_option = click.option(
     "--type-fields", is_flag=True, help="Include type-specific fields (product, vendor, state, ...)."
 )
 @click.option("--trashed", is_flag=True)
+@brief_option
 @pass_state
 def assets_list(
     state: State,
@@ -1365,19 +1497,18 @@ def assets_list(
     search: str | None,
     type_fields: bool,
     trashed: bool,
+    brief: bool,
 ) -> None:
-    """List assets."""
-    emit(
-        state,
-        assets_api.list_assets(
-            state.client,
-            types=list(types) or None,
-            include_type_fields=type_fields,
-            filter=filter_query,
-            search=search,
-            trashed=trashed,
-        ),
+    """List assets (--brief: id, name, type, vendor, product, state)."""
+    records = assets_api.list_assets(
+        state.client,
+        types=list(types) or None,
+        include_type_fields=type_fields or brief,  # vendor, product and state are type fields
+        filter=filter_query,
+        search=search,
+        trashed=trashed,
     )
+    show(state, brief, records)
 
 
 @assets.command("get")
@@ -1407,6 +1538,7 @@ def assets_types(state: State) -> None:
             ),
             key=lambda row: str(row["path"]).casefold(),
         ),
+        table=True,
     )
 
 
@@ -1429,10 +1561,11 @@ def assets_fields(state: State, asset_type: str) -> None:
 
 @assets.command("devices")
 @type_option
+@brief_option
 @pass_state
-def assets_devices(state: State, types: tuple[str, ...]) -> None:
+def assets_devices(state: State, brief: bool, types: tuple[str, ...]) -> None:
     """Assets of the device types (FRESH_DEVICE_ASSET_TYPES unless --type)."""
-    emit(state, assets_api.list_devices(state.client, types=list(types) or None))
+    show(state, brief, assets_api.list_devices(state.client, types=list(types) or None))
 
 
 @assets.command("update")
@@ -1452,15 +1585,16 @@ def assets_update(state: State, display_id: int, fields: tuple[str, ...]) -> Non
 @click.option("--only", type=click.Choice(["product", "vendor"]), help="Fill only this field.")
 @click.option("--label", help="Placeholder name (default FRESH_UNKNOWN_LABEL, 'Unknown').")
 @apply_option
+@plan_brief_option
 @pass_state
 def assets_tag_unknown(
-    state: State, types: tuple[str, ...], only: str | None, label: str | None, apply: bool
+    state: State, types: tuple[str, ...], only: str | None, label: str | None, apply: bool, brief: bool
 ) -> None:
     """Give assets with no product/vendor the 'Unknown' placeholders, to filter and fix later."""
     plan = maintenance.plan_tag_unknown(
         state.client, list(types), label=label, fill=(only,) if only else ("product", "vendor")
     )
-    run_plan(state, plan, apply)
+    run_plan(state, plan, apply, brief)
 
 
 @assets.command("set-product-vendor")
@@ -1474,6 +1608,7 @@ def assets_tag_unknown(
 @click.option("--manufacturer", help="Manufacturer for products created with --create-missing.")
 @click.option("--create-missing", is_flag=True, help="Create the product/vendor if it doesn't exist.")
 @apply_option
+@plan_brief_option
 @pass_state
 def assets_set_product_vendor(
     state: State,
@@ -1487,6 +1622,7 @@ def assets_set_product_vendor(
     manufacturer: str | None,
     create_missing: bool,
     apply: bool,
+    brief: bool,
 ) -> None:
     """Set product and/or vendor on selected assets, e.g. --current-vendor Unknown --name 'fw-*'."""
     plan = maintenance.plan_set_product_vendor(
@@ -1501,7 +1637,7 @@ def assets_set_product_vendor(
         manufacturer=manufacturer,
         create_missing=create_missing,
     )
-    run_plan(state, plan, apply)
+    run_plan(state, plan, apply, brief)
 
 
 # -- products and vendors ------------------------------------------------------------------
@@ -1515,11 +1651,12 @@ def products() -> None:
 @products.command("list")
 @click.option("--type", "asset_type", help="Only products of this asset type (name or id).")
 @click.option("--name", help="Name substring or glob.")
+@brief_option
 @pass_state
-def products_list(state: State, asset_type: str | None, name: str | None) -> None:
+def products_list(state: State, brief: bool, asset_type: str | None, name: str | None) -> None:
     """List products."""
     type_id = assets_api.asset_type_tree(state.client).resolve(asset_type).id if asset_type else None
-    emit(state, catalog_api.list_products(state.client, asset_type_id=type_id, name=name))
+    show(state, brief, catalog_api.list_products(state.client, asset_type_id=type_id, name=name))
 
 
 @products.command("get")
@@ -1576,18 +1713,37 @@ def vendors() -> None:
 
 @vendors.command("list")
 @click.option("--name", help="Name substring or glob.")
+@brief_option
 @pass_state
-def vendors_list(state: State, name: str | None) -> None:
+def vendors_list(state: State, brief: bool, name: str | None) -> None:
     """List vendors."""
-    emit(state, catalog_api.list_vendors(state.client, name=name))
+    show(state, brief, catalog_api.list_vendors(state.client, name=name))
 
 
 @vendors.command("get")
-@click.argument("vendor_id", type=int)
+@click.argument("vendor_ids", type=int, nargs=-1, required=True)
+@brief_option
 @pass_state
-def vendors_get(state: State, vendor_id: int) -> None:
-    """One vendor."""
-    emit(state, catalog_api.get_vendor(state.client, vendor_id))
+def vendors_get(state: State, vendor_ids: tuple[int, ...], brief: bool) -> None:
+    """One or more vendors by id: `vendors get 11 12 13` (a list; a single id gives the object)."""
+    wanted = list(dict.fromkeys(vendor_ids))
+
+    def fetch(vendor_id: int) -> Vendor | None:
+        try:
+            return catalog_api.get_vendor(state.client, vendor_id)
+        except FreshServiceNotFoundError:
+            return None
+
+    found = [vendor for vendor in state.client.parallel(fetch, wanted, label="vendors") if vendor is not None]
+    missing = sorted(set(wanted) - {vendor.id for vendor in found})
+    if not found:
+        raise click.ClickException(f"No vendor with id {', '.join(map(str, missing))}")
+    if missing:
+        log.warning("No vendor with id %s", ", ".join(map(str, missing)))
+    if brief:
+        show(state, True, found)
+    else:
+        emit(state, found[0] if len(vendor_ids) == 1 else found)
 
 
 @vendors.command("create")
@@ -1626,6 +1782,7 @@ def vendors_delete(state: State, vendor_id: int, yes: bool) -> None:
 @click.option("--skip-assets", is_flag=True, help="Don't scan assets (saves a full asset listing).")
 @click.option("--skip-contracts", is_flag=True)
 @apply_option
+@plan_brief_option
 @pass_state
 def vendors_merge(
     state: State,
@@ -1635,6 +1792,7 @@ def vendors_merge(
     skip_assets: bool,
     skip_contracts: bool,
     apply: bool,
+    brief: bool,
 ) -> None:
     """Re-point software, assets and contracts from SOURCES (names, globs or ids) to --into."""
     plan = maintenance.plan_vendor_merge(
@@ -1645,7 +1803,7 @@ def vendors_merge(
         include_assets=not skip_assets,
         include_contracts=not skip_contracts,
     )
-    run_plan(state, plan, apply)
+    run_plan(state, plan, apply, brief)
 
 
 # -- software ---------------------------------------------------------------------------------
@@ -1664,35 +1822,50 @@ publisher_option = click.option(
 )
 
 
+def show_software(state: State, entries: list[Any], brief: bool) -> None:
+    """Software with its usage (devices per version) by default; --brief: the API's counts only."""
+    if brief:
+        emit(state, views.brief(state.client, entries), table=True)
+    else:
+        emit(state, software_api.software_usage(state.client, entries))
+
+
 @software.command("list")
 @publisher_option
 @click.option("--no-publisher", is_flag=True, help="Only entries with no (existing) publisher.")
 @click.option("--name", help="Name substring or glob.")
 @click.option("--status", help="managed, ignored, blacklisted or none.")
+@brief_option
 @pass_state
 def software_list(
-    state: State, vendor: str | None, no_publisher: bool, name: str | None, status: str | None
+    state: State, vendor: str | None, no_publisher: bool, name: str | None, status: str | None, brief: bool
 ) -> None:
-    """List software entries, with publisher_name filled in."""
+    """List software entries with their usage: devices in total and per version.
+
+    That is one installations call per entry; narrow with --publisher/--name, or use
+    --brief for name, publisher and the API's install/user counts only.
+    """
     if vendor and no_publisher:
         raise click.UsageError("--publisher or --no-publisher, not both")
-    emit(
-        state,
-        software_api.list_software(
-            state.client, vendor=vendor, without_publisher=no_publisher, name=name, status=status
-        ),
+    entries = software_api.list_software(
+        state.client, vendor=vendor, without_publisher=no_publisher, name=name, status=status
     )
+    show_software(state, entries, brief)
 
 
-@software.command("publishers")
-@click.option("--name", help="Publisher name substring or glob.")
-@click.option(
-    "--no-unassigned", is_flag=True, help="Leave out the row for entries with no (existing) publisher."
-)
+def _publishers_list(state: State, search: str | None, no_unassigned: bool, brief: bool) -> None:
+    publishers = software_api.list_publishers(state.client, name=search, include_unassigned=not no_unassigned)
+    emit(state, views.brief(state.client, publishers) if brief else publishers, table=True)
+
+
+@software.command("publishers", hidden=True, deprecated=True)
+@click.option("--name", "search", help="Publisher name substring or glob.")
+@click.option("--no-unassigned", is_flag=True)
+@brief_option
 @pass_state
-def software_publishers(state: State, name: str | None, no_unassigned: bool) -> None:
-    """Vendors that publish software, with entry, installation and user counts."""
-    emit(state, software_api.list_publishers(state.client, name=name, include_unassigned=not no_unassigned))
+def software_publishers(state: State, search: str | None, no_unassigned: bool, brief: bool) -> None:
+    """Use `publishers list`."""
+    _publishers_list(state, search, no_unassigned, brief)
 
 
 @software.command("get")
@@ -1753,17 +1926,28 @@ def software_update(
 @click.option("--version", help='Exact, glob ("24.*") or range ("<24.09").')
 @click.option("--summary", is_flag=True, help="Per software: device counts per version.")
 @click.option("--by-device", is_flag=True, help="Grouped per device.")
+@click.option(
+    "--brief", is_flag=True, help="One row per software and version with its device count, as a table."
+)
 @pass_state
 def software_where(
-    state: State, vendor: str | None, name: str | None, version: str | None, summary: bool, by_device: bool
+    state: State,
+    vendor: str | None,
+    name: str | None,
+    version: str | None,
+    summary: bool,
+    by_device: bool,
+    brief: bool,
 ) -> None:
     """Every device with the matching software installed."""
     if not (vendor or name):
         raise click.UsageError("Give --publisher and/or --name (all software would be one call per entry)")
-    if summary and by_device:
-        raise click.UsageError("--summary or --by-device, not both")
+    if sum((summary, by_device, brief)) > 1:
+        raise click.UsageError("Pick one of --summary, --by-device, --brief")
     installs = software_api.where_installed(state.client, vendor=vendor, name=name, version=version)
-    if summary:
+    if brief:
+        emit(state, software_api.version_rows(installs), table=True)
+    elif summary:
         emit(state, software_api.summarise_installs(installs))
     elif by_device:
         emit(state, software_api.by_device(installs))
@@ -1777,13 +1961,14 @@ def software_where(
 @click.option("--into", required=True, help="The entry to keep (exact name or id); created if missing.")
 @click.option("--delete", is_flag=True, help="Delete the sources (default: mark them ignored).")
 @apply_option
+@plan_brief_option
 @pass_state
 def software_merge(
-    state: State, sources: tuple[str, ...], vendor: str, into: str, delete: bool, apply: bool
+    state: State, sources: tuple[str, ...], vendor: str, into: str, delete: bool, apply: bool, brief: bool
 ) -> None:
     """Move installations and users of SOURCES (names, globs or ids) into --into, within one vendor."""
     plan = maintenance.plan_software_merge(state.client, vendor, list(sources), into, delete=delete)
-    run_plan(state, plan, apply)
+    run_plan(state, plan, apply, brief)
 
 
 @software.command("delete")
@@ -1795,6 +1980,7 @@ def software_merge(
     "--include-used", is_flag=True, help="Also delete entries with installations, users or licenses."
 )
 @apply_option
+@plan_brief_option
 @pass_state
 def software_delete(
     state: State,
@@ -1804,12 +1990,86 @@ def software_delete(
     status: str | None,
     include_used: bool,
     apply: bool,
+    brief: bool,
 ) -> None:
     """Delete software entries (only unused ones unless --include-used)."""
     plan = maintenance.plan_software_delete(
         state.client, vendor=vendor, name=name, ids=ids, status=status, include_used=include_used
     )
-    run_plan(state, plan, apply)
+    run_plan(state, plan, apply, brief)
+
+
+@software.command("cleanup")
+@click.option("--publisher", help="Only this publisher's software (id, name or glob); skips unregistered.")
+@click.option("--no-unregistered", is_flag=True, help="Leave software with no (existing) publisher alone.")
+@click.option("--keep-publishers", is_flag=True, help="Delete unused software only, never vendors.")
+@click.option(
+    "--orphan-vendors",
+    is_flag=True,
+    help="Also delete vendors with no software and nothing referencing them (e.g. left by an earlier run).",
+)
+@apply_option
+@plan_brief_option
+@pass_state
+def software_cleanup(
+    state: State,
+    publisher: str | None,
+    no_unregistered: bool,
+    keep_publishers: bool,
+    orphan_vendors: bool,
+    apply: bool,
+    brief: bool,
+) -> None:
+    """Delete software with no installations, users or licenses, then publishers left empty.
+
+    Per publisher (and for software without one): unused entries are deleted; a publisher
+    whose software is then all gone is deleted too, unless assets, contracts or purchase
+    orders still reference it. Prints the plan; --apply makes the changes.
+    """
+    plan = maintenance.plan_software_cleanup(
+        state.client,
+        publisher=publisher,
+        include_unregistered=not no_unregistered,
+        delete_publishers=not keep_publishers,
+        orphan_vendors=orphan_vendors,
+    )
+    run_plan(state, plan, apply, brief)
+
+
+# -- publishers ---------------------------------------------------------------------------
+
+
+@main.group()
+def publishers() -> None:
+    """Software publishers (the vendors software entries name) and their software."""
+
+
+@publishers.command("list")
+@click.option("--search", help="Publisher name substring or glob.")
+@click.option(
+    "--no-unassigned", is_flag=True, help="Leave out the row for software with no (existing) publisher."
+)
+@brief_option
+@pass_state
+def publishers_list(state: State, search: str | None, no_unassigned: bool, brief: bool) -> None:
+    """Publishers with their number of software entries, installs and users (API counts only)."""
+    _publishers_list(state, search, no_unassigned, brief)
+
+
+@publishers.command("software")
+@click.argument("publisher")
+@click.option("--name", help="Only software whose name contains this (substring or glob).")
+@brief_option
+@pass_state
+def publishers_software(state: State, publisher: str, name: str | None, brief: bool) -> None:
+    """The distinct software of PUBLISHER (id, name or glob), with usage per version.
+
+    --brief: name and the API's install/user counts only, without fetching installations.
+    """
+    entries = software_api.list_software(state.client, vendor=publisher, name=name)
+    if not entries and not software_api.publisher_ids(catalog_api.list_vendors(state.client), publisher):
+        raise click.ClickException(f"No publisher matches {publisher!r} (see `freshservice publishers list`)")
+    show_software(state, entries, brief)
 
 
 if __name__ == "__main__":  # pragma: no cover

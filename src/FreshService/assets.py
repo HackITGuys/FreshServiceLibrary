@@ -216,7 +216,7 @@ def assets_by_display_id(
             except FreshServiceNotFoundError:
                 return None
 
-        for asset in client.parallel(fetch, missing):
+        for asset in client.parallel(fetch, missing, label="assets"):
             if asset is not None:
                 found[asset.display_id] = asset
         return found

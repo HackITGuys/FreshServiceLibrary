@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from FreshService._util import drop_none, workspace
@@ -28,12 +29,15 @@ from FreshService.models import (
     Publisher,
     Software,
     SoftwareLicense,
+    SoftwareUsage,
     SoftwareUser,
     Vendor,
 )
 
 log = logging.getLogger("FreshService")
 
+USAGE_WARN_AT = 100
+"""software_usage() warns above this many installation fetches (one call or more each)."""
 ID_CHUNK = 50
 """Ids per bulk-delete call (they go in the query string)."""
 SOFTWARE_KEYS = ("applications", "application")
@@ -56,6 +60,31 @@ def publisher_ids(vendors: Iterable[Vendor], publisher: str | int) -> set[int]:
     return {item.id for item in pool if text_matches(item.name, text)}
 
 
+def _catalogue(
+    client: FreshServiceClient, vendors: Iterable[Vendor] | None, workspace_id: int | None
+) -> tuple[list[Software], list[Vendor]]:
+    """Every software entry (publisher_name filled in) and every vendor. Without `vendors`
+    both listings are fetched at the same time: neither needs the other until the end."""
+    params = drop_none({"workspace_id": workspace(client, workspace_id)})
+
+    def fetch_entries() -> list[Software]:
+        return [
+            Software.model_validate(raw) for raw in client.paginate("/applications", SOFTWARE_KEYS, params)
+        ]
+
+    if vendors is not None:
+        pool, entries = list(vendors), fetch_entries()
+    else:
+        with ThreadPoolExecutor(max_workers=1) as background:
+            pending = background.submit(list_vendors, client)
+            entries = fetch_entries()
+            pool = pending.result()
+    names = {item.id: item.name for item in pool}
+    for entry in entries:
+        entry.publisher_name = names.get(entry.publisher_id) if entry.publisher_id is not None else None
+    return entries, pool
+
+
 def list_software(
     client: FreshServiceClient,
     *,
@@ -74,14 +103,7 @@ def list_software(
     publisher, or one that no longer exists. status "none": entries not yet triaged.
     Pass `vendors` (from list_vendors) to avoid fetching them again.
     """
-    pool = list(vendors) if vendors is not None else list_vendors(client)
-    names = {item.id: item.name for item in pool}
-    params = drop_none({"workspace_id": workspace(client, workspace_id)})
-    entries = [
-        Software.model_validate(raw) for raw in client.paginate("/applications", SOFTWARE_KEYS, params)
-    ]
-    for entry in entries:
-        entry.publisher_name = names.get(entry.publisher_id) if entry.publisher_id is not None else None
+    entries, pool = _catalogue(client, vendors, workspace_id)
 
     ids: set[int] | None = set(vendor_ids) if vendor_ids is not None else None
     if vendor is not None and str(vendor).strip():
@@ -120,8 +142,11 @@ def list_publishers(
     the entries with no publisher, or one that no longer exists. Pass `software`/`vendors`
     you already have to skip fetching them.
     """
-    pool = list(vendors) if vendors is not None else list_vendors(client)
-    entries = list(software) if software is not None else list_software(client, vendors=pool)
+    if software is None:
+        entries, pool = _catalogue(client, vendors, None)
+    else:
+        entries = list(software)
+        pool = list(vendors) if vendors is not None else list_vendors(client)
     names = {item.id: item.name for item in pool}
     grouped: dict[int | None, list[Software]] = defaultdict(list)
     for entry in entries:
@@ -140,6 +165,48 @@ def list_publishers(
         or (publisher_id is None and include_unassigned and not name)
     ]
     return sorted(publishers, key=lambda p: (p.id is None, -p.software_count, (p.name or "").casefold()))
+
+
+def _devices_per_version(installs: Iterable[Installation]) -> tuple[int, dict[str, int]]:
+    """(distinct devices, devices per version newest first)."""
+    per_version: dict[str, set[int]] = defaultdict(set)
+    devices: set[int] = set()
+    for install in installs:
+        devices.add(install.installation_machine_id)
+        per_version[install.version or ""].add(install.installation_machine_id)
+    ordered = sorted(per_version.items(), key=lambda item: version_key(item[0]), reverse=True)
+    return len(devices), {version: len(ids) for version, ids in ordered}
+
+
+def software_usage(client: FreshServiceClient, entries: Iterable[Software]) -> list[SoftwareUsage]:
+    """The entries with their usage: devices in total and per version, from their installations.
+
+    One installations call (or more, for long lists) per entry, FRESH_MAX_WORKERS at a time.
+    Entries whose installation_count is 0 are not asked. For counts only, use the entries
+    from list_software() as they are.
+    """
+    items = list(entries)
+    to_fetch = [entry for entry in items if entry.installation_count != 0]
+    if len(to_fetch) > USAGE_WARN_AT:
+        log.warning(
+            "Fetching installations for %d software entries; narrow by publisher/name or use --brief "
+            "for the API's counts only",
+            len(to_fetch),
+        )
+    fetched = dict(
+        client.parallel(
+            lambda entry: (entry.id, list_installations(client, entry.id)), to_fetch, label="installations"
+        )
+    )
+    usage = []
+    for entry in items:
+        device_count, versions = _devices_per_version(fetched.get(entry.id, []))
+        usage.append(
+            SoftwareUsage.model_validate(
+                {**entry.model_dump(), "device_count": device_count, "versions": versions}
+            )
+        )
+    return usage
 
 
 def get_software(client: FreshServiceClient, software_id: int) -> Software:
@@ -282,7 +349,9 @@ def where_installed(
     )
     entries = [entry for entry in entries if entry.installation_count != 0]
 
-    per_entry = client.parallel(lambda entry: (entry, list_installations(client, entry.id)), entries)
+    per_entry = client.parallel(
+        lambda entry: (entry, list_installations(client, entry.id)), entries, label="installations"
+    )
     pairs = [
         (entry, install)
         for entry, installs in per_entry
@@ -377,3 +446,28 @@ def by_device(installs: Iterable[DeviceInstall]) -> list[DeviceSoftware]:
             }
         )
     return sorted(grouped.values(), key=lambda d: (d.device_name or "").casefold())
+
+
+def version_rows(installs: Iterable[DeviceInstall]) -> list[dict[str, Any]]:
+    """where_installed() results as flat rows: one per software and version, with its device
+    count. Most widespread software first, newest version first."""
+    devices: dict[tuple[int, str], set[int]] = defaultdict(set)
+    first: dict[int, DeviceInstall] = {}
+    for install in installs:
+        first.setdefault(install.software_id, install)
+        devices[(install.software_id, install.version or "")].add(install.device_id)
+    per_software: dict[int, set[int]] = defaultdict(set)
+    for (software_id, _version), ids in devices.items():
+        per_software[software_id] |= ids
+    # Two stable sorts: newest version first, then software by spread and name.
+    ordered = sorted(devices, key=lambda key: version_key(key[1]), reverse=True)
+    ordered.sort(key=lambda key: (-len(per_software[key[0]]), first[key[0]].software_name.casefold(), key[0]))
+    return [
+        {
+            "publisher": first[software_id].vendor_name,
+            "software": first[software_id].software_name,
+            "version": version or None,
+            "devices": len(devices[(software_id, version)]),
+        }
+        for software_id, version in ordered
+    ]

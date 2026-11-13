@@ -713,6 +713,15 @@ class Software(ApiModel):
     updated_at: Timestamp = None
 
 
+class SoftwareUsage(Software):
+    """A software entry with its usage fetched: devices per version (from its installations)."""
+
+    device_count: int = 0
+    """Distinct devices with an installation."""
+    versions: dict[str, int] = {}
+    """Devices per reported version, newest first ("" for installations without a version)."""
+
+
 class Publisher(BaseModel):
     """A vendor that publishes software entries, with how many and how widely installed.
     id and name are None for the entries with no (existing) publisher."""

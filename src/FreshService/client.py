@@ -29,7 +29,7 @@ import mimetypes
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
@@ -60,6 +60,8 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 FileField = tuple[str, tuple[str, bytes, str]]
+ProgressHook = Callable[[str, int, int | None], None]
+"""progress(label, done, total): total is None when the size isn't known (listings)."""
 Attachments = Iterable[str | Path]
 
 
@@ -183,7 +185,8 @@ class FreshServiceClient:
             ticket = get_ticket(client, 1234)
 
     Thread-safe for the fan-outs this library does (parallel GETs through one session).
-    Pass `audit_log` to append every POST/PUT/DELETE to a JSON-lines file.
+    Pass `audit_log` to append every POST/PUT/DELETE to a JSON-lines file, and `progress`
+    (label, done, total) to hear how a long listing or fan-out is getting on.
     """
 
     def __init__(
@@ -192,6 +195,7 @@ class FreshServiceClient:
         session: requests.Session | None = None,
         *,
         audit_log: Path | None = None,
+        progress: ProgressHook | None = None,
     ) -> None:
         self.settings = settings or FreshServiceSettings()
         missing = self.settings.missing()
@@ -200,6 +204,9 @@ class FreshServiceClient:
         self.session = session or requests.Session()
         self.session.auth = (self.settings.api_key.get_secret_value(), "X")
         self.audit_log = audit_log
+        self.progress = progress
+        """Called as progress(label, done, total) while listing and fanning out. None: silent."""
+        self._local = threading.local()
         self._lock = threading.Lock()
         self._memo: dict[str, Any] = {}
 
@@ -226,13 +233,41 @@ class FreshServiceClient:
         with self._lock:
             return self._memo.setdefault(key, value)  # type: ignore[no-any-return]
 
-    def parallel(self, func: Callable[[T], R], items: Iterable[T]) -> list[R]:
-        """func over items with up to FRESH_MAX_WORKERS requests in flight, in order."""
+    def parallel(self, func: Callable[[T], R], items: Iterable[T], *, label: str | None = None) -> list[R]:
+        """func over items with up to FRESH_MAX_WORKERS requests in flight; results in order.
+
+        With a label, progress is reported as done/total. Listings inside func don't report
+        their own progress (they would interleave).
+        """
         work = list(items)
+
+        def quietly(item: T) -> R:
+            was = getattr(self._local, "quiet", False)
+            self._local.quiet = True
+            try:
+                return func(item)
+            finally:
+                self._local.quiet = was
+
         if len(work) <= 1 or self.settings.max_workers <= 1:
-            return [func(item) for item in work]
+            results = []
+            for done, item in enumerate(work, start=1):
+                results.append(quietly(item))
+                if label:
+                    self.report(label, done, len(work))
+            return results
         with ThreadPoolExecutor(max_workers=self.settings.max_workers) as pool:
-            return list(pool.map(func, work))
+            futures = [pool.submit(quietly, item) for item in work]
+            if label:
+                for done, _ in enumerate(as_completed(futures), start=1):
+                    self.report(label, done, len(work))
+            return [future.result() for future in futures]
+
+    def report(self, label: str, done: int, total: int | None = None) -> None:
+        """Progress for whoever set `progress` (the CLI does; the library alone is silent).
+        total None means "records so far" (most listings don't say how many there are)."""
+        if self.progress is not None and not getattr(self._local, "quiet", False):
+            self.progress(label, done, total)
 
     # -- requests ---------------------------------------------------------------
 
@@ -428,22 +463,62 @@ class FreshServiceClient:
         *,
         page_size: int | None = None,
     ) -> Iterator[dict[str, Any]]:
-        """Every record of a paged list endpoint, following the `link: rel="next"` header."""
+        """Every record of a paged list endpoint, in order.
+
+        Pages are independent (`page=N`), so after the first they are fetched several at a
+        time: 1, 1, 2, 4, ... up to FRESH_MAX_WORKERS per round. A listing ends at the first page
+        without `link: rel="next"` (or an empty one); pages fetched past the end are discarded,
+        errors on them included. At most max_workers - 1 extra calls per listing.
+        """
         size = page_size or self.settings.page_size
+        base = dict(params or {})
+        label = path.strip("/")
         previous: tuple[str, str] | None = None
-        for page in range(1, MAX_PAGES + 1):
-            response = self.request("GET", path, params={**(params or {}), "page": page, "per_page": size})
-            records = _as_list(extract(response.json(), key, path), path) if response.content else []
-            if not records:
-                return
-            marker = (json.dumps(records[0], sort_keys=True), json.dumps(records[-1], sort_keys=True))
-            if marker == previous:
-                raise FreshServiceError(f"/api/v2{path} served page {page} identical to page {page - 1}")
-            previous = marker
-            yield from records
-            if not self._has_next(response, len(records), size):
-                return
+        count = 0
+        page, batch = 1, 1
+        while page <= MAX_PAGES:
+            numbers = list(range(page, min(page + batch, MAX_PAGES + 1)))
+            for number, outcome in zip(
+                numbers, self._fetch_pages(path, key, base, numbers, size), strict=True
+            ):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                records, has_next = outcome
+                if not records:
+                    return
+                marker = (json.dumps(records[0], sort_keys=True), json.dumps(records[-1], sort_keys=True))
+                if marker == previous:
+                    raise FreshServiceError(
+                        f"/api/v2{path} served page {number} identical to page {number - 1}"
+                    )
+                previous = marker
+                count += len(records)
+                self.report(label, count)
+                yield from records
+                if not has_next:
+                    return
+            page += len(numbers)
+            batch = min(batch * 2 if page > 2 else 1, self.settings.max_workers)
         raise FreshServiceError(f"/api/v2{path} exceeded {MAX_PAGES} pages; refusing to continue.")
+
+    def _fetch_pages(
+        self, path: str, key: str | Sequence[str], params: dict[str, Any], numbers: list[int], size: int
+    ) -> list[tuple[list[dict[str, Any]], bool] | Exception]:
+        """These pages, in order, each as (records, has_next) or the exception fetching it raised
+        (raised by paginate only if the page turns out to be needed)."""
+
+        def fetch(number: int) -> tuple[list[dict[str, Any]], bool] | Exception:
+            try:
+                response = self.request("GET", path, params={**params, "page": number, "per_page": size})
+                records = _as_list(extract(response.json(), key, path), path) if response.content else []
+                return records, self._has_next(response, len(records), size)
+            except Exception as exc:  # handed back; paginate raises it only if the page is needed
+                return exc
+
+        if len(numbers) == 1:
+            return [fetch(numbers[0])]
+        with ThreadPoolExecutor(max_workers=len(numbers)) as pool:
+            return list(pool.map(fetch, numbers))
 
     def paginate_query(
         self,

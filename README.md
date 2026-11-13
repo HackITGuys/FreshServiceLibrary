@@ -91,8 +91,9 @@ with FreshServiceClient() as client:
 | Org | `list_agents`, `get_agent`, `resolve_agent`, `list_groups`, `list_roles`, `list_departments`, `list_locations` |
 | Assets | `list_assets`, `list_devices`, `get_asset`, `update_asset`, `set_asset_product_vendor`, `delete_asset`, `assets_by_display_id`, `list_asset_types`, `asset_type_tree`, `asset_type_fields`, `product_vendor_fields` |
 | Products / vendors | `list_products`, `get/create/update/delete_product`, `list_vendors`, `get/create/update/delete_vendor`, `find_or_create_product`, `find_or_create_vendor`, `list_contracts` |
-| Software | `list_software`, `list_publishers`, `get/create/update/delete_software`, `list_installations`, `add_installation`, `remove_installations`, `list_software_users`, `add_software_users`, `remove_software_users`, `list_licenses`, `where_installed`, `summarise_installs`, `by_device` |
-| Clean-up | `plan_tag_unknown`, `plan_set_product_vendor`, `plan_vendor_merge`, `plan_software_merge`, `plan_software_delete`, `apply_plan` |
+| Software | `list_software`, `list_publishers`, `software_usage`, `version_rows`, `get/create/update/delete_software`, `list_installations`, `add_installation`, `remove_installations`, `list_software_users`, `add_software_users`, `remove_software_users`, `list_licenses`, `where_installed`, `summarise_installs`, `by_device` |
+| Clean-up | `plan_tag_unknown`, `plan_set_product_vendor`, `plan_vendor_merge`, `plan_software_merge`, `plan_software_delete`, `plan_software_cleanup`, `software_use`, `vendor_references`, `apply_plan` |
+| Views | `brief` (identifying fields of any listing), `render_table` |
 
 Bodies (`description`, `body`, `body_html`) are HTML and sent as given; call `markdown_to_html()` first for Markdown. Attachments are local file paths; with any, the request goes as multipart. For anything not wrapped, `client.get(path)`, `client.paginate(path, key)`, `client.post/put/delete` give you raw JSON with auth, retries and paging handled.
 
@@ -104,13 +105,27 @@ Bodies (`description`, `body`, `body_html`) are HTML and sent as given; call `ma
 - **There's no merge endpoint for vendors or software.** Merges are done client-side and aren't atomic. Every action reports done, failed or skipped, and a re-run picks up what's left. Moved installations lose their original `created_at`. Licenses can't be moved, so software with licenses is left alone. Discovery may re-create a merged-away entry on its next scan.
 - **Products don't link to vendors.** A product belongs to one asset type and has only a free-text manufacturer. An asset's vendor is its own field, `vendor_<type id>` in `type_fields`, like `product_<type id>`; `product_vendor_fields()` finds the real names.
 - **Assets can't be filtered by product or vendor**, and the asset filter stops at 1200 results (the library raises `FreshServiceTruncatedError` rather than return part of them). Type filters read the full asset listing, and product/vendor work also needs `type_fields`, which makes each page cost 3 API credits.
+- **Listings are paged at 100 per request, and there's no publishers endpoint.** A publisher is a vendor with software, so `publishers list` reads every vendor and every software entry (on a large account roughly 95 requests). The client fetches pages several at a time (1, 1, 2, 4, then up to `FRESH_MAX_WORKERS`, default 8), and vendors at the same time as software: a few seconds instead of half a minute.
 - **There's no fleet-wide installations list in the classic API** (`/itam/software_installations` exists only on accounts created after 31 March 2026). `where_installed` makes one call per matching software entry, in parallel (`FRESH_MAX_WORKERS`), and skips entries that report no installations.
 - **Alerts can't be created** through the API, and need the Alert Management feature. Agent roles are read-only. Ticket lists without `--since` cover only tickets created in the last 30 days.
 - **Rate limits are per account and per minute** (100 to 500 depending on plan, lower for listing tickets, assets and agents), shared with every other integration. The client honours `Retry-After` and pauses when `X-RateLimit-Remaining` runs low.
 
 ## CLI
 
-Every command prints JSON on stdout; logs and errors go to stderr. Bodies are Markdown (`--body`, `--body-file FILE` or `-` for stdin) unless `--html` is given.
+Commands print JSON on stdout, except quick (`--brief`) listings and naturally flat ones (`publishers list`, `assets types`), which print a table. `--json` forces JSON everywhere, and `-o FILE` always writes JSON. Logs and errors go to stderr. Bodies are Markdown (`--body`, `--body-file FILE` or `-` for stdin) unless `--html` is given.
+
+**`--brief`** is available on every listing (tickets, requests items, changes, articles, announcements, alerts, org, assets, devices, products, vendors, software, publishers). It keeps only the identifying fields, with ids turned into names (group, vendor, product, asset type), and never makes per-record calls. If your role can't read a name listing, the id is shown instead:
+
+| Listing | `--brief` columns |
+|---|---|
+| tickets, changes | id, subject, group, state |
+| articles / announcements / alerts | id, title, state, folder_id / id, title, state / id, subject, severity, state, resource |
+| assets, devices | id, name, type, vendor, product, state |
+| products / vendors | id, name, type, manufacturer / id, name |
+| software, `publishers software` | id, name, publisher, installs, users (the API's counts) |
+| `publishers list` | id, name, software, installs |
+| `software where` | publisher, software, version, devices (one row per version) |
+| bulk commands (plans) | #, action, target, status, error |
 
 ```sh
 freshservice tickets note 1234 --body-file update.md --attach report.pdf     # private by default
@@ -126,17 +141,21 @@ freshservice announcements create --title "Email outage" --body "Back by 14:00" 
 freshservice alerts list --severity critical --state open --since 2026-11-01
 freshservice org groups
 freshservice assets devices
-freshservice software publishers                         # vendors that publish software, with counts
-freshservice software list --publisher Mozilla           # by name (substring/glob) or id; publisher_name filled in
-freshservice software list --no-publisher                # entries with no (existing) publisher
-freshservice software where --publisher Mozilla --name Firefox --version "<128" --summary
+freshservice tickets list --brief                        # id, subject, group, state as a table
+freshservice assets devices --brief                      # id, name, type, vendor, product, state
+freshservice publishers list --search goo                # publishers with software/install/user counts
+freshservice publishers software Mozilla                 # its software, with devices per version
+freshservice publishers software 11 --brief              # just names and the API's counts: fast
+freshservice software list --no-publisher --brief        # software with no (existing) publisher
+freshservice software where --publisher Mozilla --name Firefox --version "<128" --brief
+freshservice --json tickets list --brief | jq '.[] | select(.state == "open")'
 ```
 
-Global options: `--env-file`, `-o/--output FILE`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines) and `-v`. Single deletes ask for confirmation unless `--yes` is given.
+Global options: `--env-file`, `-o/--output FILE`, `--json`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines), `--progress/--no-progress` and `-v`. On a terminal, a live status line on stderr shows how far a listing or fan-out has got (`applications: 3,400 records...`, `installations: 34/120...`). It is off when stderr is piped or logged, and the library itself never prints it; pass `progress=` to `FreshServiceClient` to get the same callbacks. Single deletes ask for confirmation unless `--yes` is given.
 
 ### Clean-up: plan, review, `--apply`
 
-These commands print a plan (every write with before/after values) and change nothing until you run them again with `--apply`:
+These commands print a plan (every write with before/after values) and change nothing until you run them again with `--apply`. Add `--brief` to see the actions as a table:
 
 ```sh
 # 1. Firewalls and switches with no product/vendor get vendor "Unknown" and product "Unknown (<type>)".
@@ -157,7 +176,16 @@ freshservice software merge --vendor Google --into "Google Chrome" "Google Chrom
 
 # Delete software entries with no installations, users or licenses.
 freshservice software delete --status none --apply
+
+# The full sweep: per publisher (and for software without one), delete every unused entry,
+# then every publisher left with no software, unless assets, contracts or purchase orders still use it.
+freshservice software cleanup --brief
+freshservice software cleanup --apply                        # safe to schedule
+freshservice software cleanup --publisher "OldCorp*" --apply # one publisher only
+freshservice software cleanup --orphan-vendors --apply       # also vendors with no software and no references
 ```
+
+"Unused" means 0 installations, 0 users and 0 licenses (the contracts the API attaches to software; the API has no SLA link for software). Installation and user counts come from the software listing. Licenses take one call per entry, and only for entries with neither installations nor users. If assets, contracts or purchase orders can't be read, no vendor is deleted.
 
 Placeholder products are per asset type, because a product belongs to exactly one type. They share the `Unknown` prefix (`FRESH_UNKNOWN_LABEL`) so they can be filtered together.
 

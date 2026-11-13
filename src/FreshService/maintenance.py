@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from FreshService.assets import (
@@ -59,6 +60,7 @@ from FreshService.software import (
     list_licenses,
     list_software,
     list_software_users,
+    publisher_ids,
 )
 
 _REF = re.compile(r"<ref:([^>]+)>")
@@ -103,7 +105,8 @@ def apply_plan(client: FreshServiceClient, plan: MaintenancePlan) -> Maintenance
     """Make the plan's writes in order. Returns a copy with each action's status."""
     result = plan.model_copy(deep=True)
     refs: dict[str, int] = {}
-    for action in result.actions:
+    for done, action in enumerate(result.actions, start=1):
+        client.report("applying", done, len(result.actions))
         if action.status != "planned":
             continue
         blocked = [index for index in action.requires if result.actions[index].status != "done"]
@@ -586,7 +589,9 @@ def plan_software_merge(
             len(list_licenses(client, entry.id)),
         )
 
-    sources_usage = client.parallel(usage, sorted(chosen.values(), key=lambda e: e.name.casefold()))
+    sources_usage = client.parallel(
+        usage, sorted(chosen.values(), key=lambda e: e.name.casefold()), label="usage"
+    )
     movable = []
     for entry, installs, users, licenses in sources_usage:
         if licenses:
@@ -760,6 +765,55 @@ def plan_software_merge(
 # -- software delete ----------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SoftwareUse:
+    """How much one software entry is in use."""
+
+    entry: Software
+    installations: int
+    users: int
+    licenses: int | None
+    """None: not checked, because the entry has installations or users anyway."""
+
+    @property
+    def unused(self) -> bool:
+        return not (self.installations or self.users or self.licenses)
+
+
+def software_use(client: FreshServiceClient, entries: Iterable[Software]) -> list[SoftwareUse]:
+    """Installations, users and licenses per entry. The listing's counts are used where the API
+    gives them; licenses take one call per entry, and only for entries with no installations
+    and no users (the ones that could be unused)."""
+
+    def use(entry: Software) -> SoftwareUse:
+        installs = entry.installation_count
+        if installs is None:
+            installs = len(list_installations(client, entry.id))
+        users = entry.user_count
+        if users is None:
+            users = len(list_software_users(client, entry.id))
+        licenses = len(list_licenses(client, entry.id)) if not (installs or users) else None
+        return SoftwareUse(entry, installs, users, licenses)
+
+    return client.parallel(use, list(entries), label="usage")
+
+
+def _delete_software_action(build: _Builder, use: SoftwareUse) -> int:
+    entry = use.entry
+    return build.add(
+        action="delete_software",
+        target=f"software {entry.id} {entry.name!r} ({entry.publisher_name or 'no publisher'})",
+        method="DELETE",
+        path=f"/applications/{entry.id}",
+        before={
+            "installations": use.installations,
+            "users": use.users,
+            "licenses": use.licenses,
+            "status": entry.status,
+        },
+    )
+
+
 def plan_software_delete(
     client: FreshServiceClient,
     *,
@@ -778,37 +832,159 @@ def plan_software_delete(
         wanted = set(ids)
         entries = [entry for entry in entries if entry.id in wanted]
     build = _Builder("software-delete")
-
-    def usage(entry: Software) -> tuple[Software, int, int, int]:
-        installs = entry.installation_count
-        if installs is None:
-            installs = len(list_installations(client, entry.id))
-        users = entry.user_count
-        if users is None:
-            users = len(list_software_users(client, entry.id))
-        return entry, installs, users, len(list_licenses(client, entry.id))
-
-    kept = 0
-    rows = (
-        client.parallel(usage, entries)
+    uses = (
+        software_use(client, entries)
         if not include_used
-        else [(e, e.installation_count or 0, e.user_count or 0, 0) for e in entries]
+        else [SoftwareUse(e, e.installation_count or 0, e.user_count or 0, None) for e in entries]
     )
-    for entry, installs, users, licenses in sorted(rows, key=lambda row: row[0].name.casefold()):
-        if not include_used and (installs or users or licenses):
+    kept = 0
+    for use in sorted(uses, key=lambda u: u.entry.name.casefold()):
+        if not include_used and not use.unused:
             kept += 1
             continue
-        build.add(
-            action="delete_software",
-            target=f"software {entry.id} {entry.name!r}",
-            method="DELETE",
-            path=f"/applications/{entry.id}",
-            before={"installations": installs, "users": users, "licenses": licenses, "status": entry.status},
-        )
+        _delete_software_action(build, use)
     build.plan.summary = {
         "selected": len(entries),
         "to_delete": len(build.plan.actions),
         "kept_in_use": kept,
         "include_used": include_used,
+    }
+    return build.plan
+
+
+# -- software and publisher cleanup -------------------------------------------------------
+
+
+def vendor_references(client: FreshServiceClient, vendor_ids: Iterable[int]) -> dict[int, list[str]]:
+    """What still points at each vendor besides software: assets (vendor field), contracts and
+    purchase orders. Raises FreshServiceError if one of them can't be read, so a caller never
+    mistakes "couldn't check" for "not referenced"."""
+    wanted = set(vendor_ids)
+    found: dict[int, list[str]] = defaultdict(list)
+    if not wanted:
+        return found
+    for asset in list_assets(client, include_type_fields=True):
+        if asset.vendor_id in wanted:
+            found[asset.vendor_id].append(f"asset {asset.display_id} {asset.name!r}")
+    for contract in list_contracts(client):
+        if contract.vendor_id in wanted:
+            found[contract.vendor_id].append(f"contract {contract.id} {contract.name!r}")
+    try:
+        orders = client.get_list("/purchase_orders", "purchase_orders")
+    except FreshServiceNotFoundError:  # accounts without purchase orders
+        orders = []
+    for order in orders:
+        vendor_id = order.get("vendor_id")
+        if vendor_id in wanted:
+            found[vendor_id].append(f"purchase order {order.get('po_number') or order.get('id')}")
+    return found
+
+
+def plan_software_cleanup(
+    client: FreshServiceClient,
+    *,
+    publisher: str | int | None = None,
+    include_unregistered: bool = True,
+    delete_publishers: bool = True,
+    orphan_vendors: bool = False,
+) -> MaintenancePlan:
+    """Wipe unused software, then the publishers left without software.
+
+    1. Group all software by publisher; entries with no publisher, or one that no longer
+       exists, are "unregistered" (included unless include_unregistered=False or a
+       publisher is given).
+    2. Delete every entry with no installations, no users and no licenses.
+    3. Delete each publisher (vendor) whose software is now all gone - unless assets,
+       contracts or purchase orders still point at it (reported, kept). If those can't be
+       read, no vendor is deleted.
+
+    orphan_vendors also deletes vendors with no software and no references at all, e.g.
+    publishers emptied by an earlier run whose vendor delete didn't happen.
+    """
+    vendors = list_vendors(client)
+    by_id = {vendor.id: vendor for vendor in vendors}
+    entries = list_software(client, vendors=vendors)
+    software_of: dict[int, list[Software]] = defaultdict(list)
+    unregistered: list[Software] = []
+    for entry in entries:
+        if entry.publisher_id in by_id:
+            software_of[entry.publisher_id].append(entry)
+        else:
+            unregistered.append(entry)
+
+    if publisher is not None:
+        selected = publisher_ids(vendors, publisher) & software_of.keys()
+        if not selected:
+            raise ValueError(f"No software publisher matches {publisher!r}")
+        include_unregistered = False
+    else:
+        selected = set(software_of)
+    scope = [entry for vendor_id in selected for entry in software_of[vendor_id]]
+    if include_unregistered:
+        scope += unregistered
+
+    uses = {use.entry.id: use for use in software_use(client, scope)}
+    build = _Builder("software-cleanup")
+    deleted_per_vendor: dict[int, list[int]] = defaultdict(list)
+    kept_in_use = 0
+    for use in sorted(
+        uses.values(), key=lambda u: ((u.entry.publisher_name or "~").casefold(), u.entry.name.casefold())
+    ):
+        if not use.unused:
+            kept_in_use += 1
+            continue
+        index = _delete_software_action(build, use)
+        if use.entry.publisher_id in selected:
+            deleted_per_vendor[use.entry.publisher_id].append(index)
+
+    emptied = [
+        vendor_id
+        for vendor_id in selected
+        if delete_publishers and len(deleted_per_vendor[vendor_id]) == len(software_of[vendor_id])
+    ]
+    orphans = (
+        [v.id for v in vendors if v.id not in software_of]
+        if orphan_vendors and publisher is None and delete_publishers
+        else []
+    )
+    candidates = emptied + orphans
+    kept_referenced: dict[int, list[str]] = {}
+    if candidates:
+        try:
+            references = vendor_references(client, candidates)
+        except FreshServiceError as exc:
+            build.warn(f"Could not check what references the vendors ({exc}); no vendor is deleted")
+            candidates, references = [], {}
+        for vendor_id in sorted(candidates, key=lambda i: by_id[i].name.casefold()):
+            refs = references.get(vendor_id)
+            if refs:
+                kept_referenced[vendor_id] = refs
+                more = f" and {len(refs) - 3} more" if len(refs) > 3 else ""
+                name = by_id[vendor_id].name
+                build.warn(f"Vendor {name!r} has no software left but is kept: {', '.join(refs[:3])}{more}")
+                continue
+            build.add(
+                action="delete_vendor",
+                target=f"vendor {vendor_id} {by_id[vendor_id].name!r}"
+                + (
+                    " (no software left)" if vendor_id in emptied else " (orphan: no software, no references)"
+                ),
+                method="DELETE",
+                path=f"/vendors/{vendor_id}",
+                requires=deleted_per_vendor.get(vendor_id, []),
+            )
+
+    actions = build.plan.actions
+    build.plan.summary = {
+        "publishers_scanned": len(selected),
+        "software_scanned": len(scope),
+        "unregistered_scanned": len(unregistered) if include_unregistered else "not included",
+        "software_to_delete": sum(1 for a in actions if a.action == "delete_software"),
+        "software_kept_in_use": kept_in_use,
+        "publishers_to_delete": sum(1 for a in actions if a.action == "delete_vendor"),
+        "publishers_kept_referenced": [
+            {"id": vendor_id, "name": by_id[vendor_id].name, "references": len(refs)}
+            for vendor_id, refs in kept_referenced.items()
+        ],
     }
     return build.plan

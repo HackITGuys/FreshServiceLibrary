@@ -49,8 +49,9 @@ class FreshServiceSettings(BaseSettings):
     max_attempts: int = 5
     page_size: int = Field(default=100, ge=1, le=100)
     """Records per page for paged endpoints (the API's maximum is 100)."""
-    max_workers: int = Field(default=4, ge=1, le=16)
-    """Parallel requests for fan-outs (installations per software, assets by id)."""
+    max_workers: int = Field(default=8, ge=1, le=16)
+    """Parallel requests: pages of one listing, and fan-outs (installations per software,
+    assets by id). Every request still counts against the account's per-minute limit."""
 
     agent_id: int | None = None
     """The agent that `--mine` / list_my_articles() means (see your profile URL, /agents/<id>).
