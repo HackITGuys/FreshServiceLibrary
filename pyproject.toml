@@ -1,6 +1,6 @@
 [project]
 name = "freshservice-library"
-version = "1.0.1"
+version = "1.0.3"
 description = "Python bindings and CLI for the Freshservice API v2: tickets, service requests, changes, solution articles, announcements, alerts, assets and software"
 readme = "README.md"
 requires-python = ">=3.12"
