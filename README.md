@@ -1,58 +1,147 @@
 # FreshServiceLibrary
 
-Python bindings and a CLI for the [Freshservice](https://www.freshworks.com/freshservice/) API v2. Functions return pydantic models, and `model_dump(mode="json")` turns any of them into a plain dict ready for JSON.
+Python bindings and a command-line tool (`freshservice`) for the [Freshservice](https://www.freshworks.com/freshservice/) API v2. Library functions return pydantic models; `model_dump(mode="json")` turns any of them into a plain dict.
 
-- **Service desk:** tickets and service requests (create, update, notes, replies, attachments), the service catalog, changes and change notes, solution articles (create, update, publish, "mine"), announcements and alerts.
-- **People:** agents, groups, roles, departments and locations.
-- **Assets and software:** assets and asset types, devices, products, vendors and software (each entry carries its publisher's name), the list of software publishers, plus "where is this software installed" by publisher, name and version.
-- **Clean-up:** placeholder ("Unknown") product and vendor for assets that have none, setting the real product and vendor later, merging duplicate vendors, merging software within one vendor, and deleting unused software. Each of these is planned first and only written with `--apply`.
+**Contents:** [What it does](#what-it-does) · [Running it](#running-it) · [Development and testing](#development-and-testing) · [Releasing a new version](#releasing-a-new-version)
 
-## Install
+## What it does
+
+| Area | What you can do |
+|---|---|
+| **Tickets** | Get, list, filter, create (also from templates), update, delete. Add notes and replies with attachments. |
+| **Service requests** | Browse the service catalog, request an item, list what was requested. Notes work as on tickets. |
+| **Changes** | Get, list, create, update and delete changes, with attachments. Add, edit and delete change notes. |
+| **Solution articles** | Categories and folders. List, search, create, update, publish and delete articles. List the articles you created ("mine"). |
+| **Announcements** | List, view, create, edit and delete. |
+| **Alerts** | List and filter alerts (by severity, state, time), view one, read its notes. |
+| **Organisation** | Agents, groups, roles, departments, locations. |
+| **Assets and devices** | Assets and asset types; devices (assets under configurable types, default "Hardware"). Set an asset's product and vendor. |
+| **Products and vendors** | List, view, create, update, delete. |
+| **Software** | Software entries with their publisher's name and usage (devices per version). The publishers and their software. Where a software is installed, by publisher, name and version (exact, glob or range such as `<128`). |
+| **Clean-up** | Placeholder "Unknown" product/vendor for assets that have none, and setting the real ones later. Merging duplicate vendors, and software within one vendor. Deleting unused software, then publishers left with none. |
+
+Three things hold across all of it:
+
+- **Bulk changes are planned first.** Clean-up commands print every write they would make (with before/after values) and change nothing until run again with `--apply`. Nothing is deleted without an explicit flag.
+- **Quick views.** Every listing takes `--brief`: only the identifying fields (names, state, counts) as a table on screen, with no extra API calls.
+- **Results stay data.** The CLI prints JSON (or a table for `--brief`), `-o FILE` always writes JSON, and the library returns models and dicts.
+
+### What the Freshservice API does and doesn't offer
+
+- **"My articles" means "created by me".** Articles can only be listed per folder and nothing filters by author, so the library walks every folder and matches the creator. There is no `/agents/me`: set `FRESH_AGENT_ID`.
+- **Change notes can't hold attachments.** Files given for a change note are attached to the change and linked in the note.
+- **Service requests take files only in the catalog item's own attachment fields.** Other attachments are added as a private note on the new request.
+- **There's no merge endpoint for vendors or software.** Merges are done client-side and aren't atomic; every action reports done, failed or skipped, and a re-run finishes the job. Licenses can't be moved, so software with licenses is left alone.
+- **Products don't link to vendors.** A product belongs to one asset type; an asset's vendor and product are separate type fields (`vendor_<type id>`, `product_<type id>`).
+- **Assets can't be filtered by product or vendor**, and the asset filter stops at 1200 results (the library raises `FreshServiceTruncatedError` rather than return part of them).
+- **There's no publishers endpoint and no fleet-wide installations list.** Publisher counts read every vendor and every software entry; "where installed" makes one call per matching software entry. Pages are fetched in parallel (`FRESH_MAX_WORKERS`, default 8), so a full publisher list takes seconds.
+- **Alerts can't be created**, and need the Alert Management feature. Ticket lists without `--since` cover only the last 30 days.
+- **Rate limits are per account and per minute** (100 to 500 depending on plan), shared with every other integration. The client honours `Retry-After` and slows down when few calls are left.
+- **What a key may do is its agent's role.** A role without "Manage Agents" can't list agents, for example. Where only a name lookup is forbidden, `--brief` shows the id instead.
+
+## Running it
+
+### Install
 
 ```sh
-uv add "freshservice-library @ git+https://github.com/HackITGuys/FreshServiceLibrary@v1.0.0"
+uv add "freshservice-library @ git+https://github.com/HackITGuys/FreshServiceLibrary@v1.3.0"   # in a project
+uv tool install "git+https://github.com/HackITGuys/FreshServiceLibrary@v1.3.0"            # just the CLI
 ```
 
-It installs as `freshservice-library`, imports as `FreshService` and needs Python 3.12 or newer.
+It installs as `freshservice-library`, imports as `FreshService` and needs Python 3.12 or newer. Pin a release tag (see [Releases](https://github.com/HackITGuys/FreshServiceLibrary/releases)).
 
-> **Upgrading from the pre-1.0 `FreshService.Client`:** that module is gone. `FreshService().add_note(ticket_id=..., message=...)` becomes `add_note(FreshServiceClient(), ticket_id, markdown_to_html(message))`. `markdown_to_html` now lives in `FreshService.formatting` and no longer treats its argument as a file path; use `markdown_file_to_html` for files. Settings are read when a client is created, not at import, and the old `.env` names (`FRESH_KEY`, `FRESH_TEMPLATE_FILEPATH`, `FRESH_DEFAULT_CONTACT_EMAIL`, `FRESH_DEFAULT_DEPT_ID`) still work.
+> **Upgrading from pre-1.0:** `FreshService.Client` is gone. `FreshService().add_note(ticket_id=..., message=...)` becomes `add_note(FreshServiceClient(), ticket_id, markdown_to_html(message))`, and `markdown_to_html` lives in `FreshService.formatting`. The old `.env` names (`FRESH_KEY`, `FRESH_TEMPLATE_FILEPATH`, `FRESH_DEFAULT_CONTACT_EMAIL`, `FRESH_DEFAULT_DEPT_ID`) still work.
 
-## Credentials
+### Configure
 
-1. In Freshservice, open your **Profile settings** and copy **Your API Key**. The key acts as that agent, with that agent's role. A role without "Manage Agents" can't list agents, for example. Every write is attributed to that agent.
-2. Put it in a `.env` file (see [.env.example](.env.example)):
+1. In Freshservice, open **Profile settings** and copy **Your API Key**. The key acts as you, with your role; every write is attributed to you.
+2. Put the settings in a `.env` file in the directory you run from (see [.env.example](.env.example)). Environment variables take precedence; `--env-file` (CLI) or `FreshServiceSettings(_env_file=...)` points elsewhere.
 
-```dotenv
-FRESH_DOMAIN=yourcompany.freshservice.com   # not a custom CNAME: the API only answers here
-FRESH_API_KEY=...
-FRESH_WORKSPACE_ID=2                        # optional; unset = the primary workspace
-FRESH_AGENT_ID=123                          # optional; what --mine means (your /agents/<id>)
-FRESH_PORTAL_URL=https://support.example.com  # optional; base for links in reports
+| Setting | Default | |
+|---|---|---|
+| `FRESH_DOMAIN` | required | `yourcompany.freshservice.com`. Not a custom CNAME: the API only answers here. |
+| `FRESH_API_KEY` | required | Your API key. |
+| `FRESH_WORKSPACE_ID` | primary workspace | Workspace for lists and creates. |
+| `FRESH_AGENT_ID` | | You, for "my articles" (the number in your agent profile URL). |
+| `FRESH_PORTAL_URL` | `https://{domain}` | Base for links in reports, e.g. your portal's CNAME. |
+| `FRESH_DEVICE_ASSET_TYPES` | `Hardware` | Asset types (comma-separated) that count as devices; child types included. |
+| `FRESH_UNKNOWN_LABEL` | `Unknown` | Name of the placeholder vendor and product prefix. |
+| `FRESH_TEMPLATE_FILE`, `FRESH_DEFAULT_*` | | Ticket templates (see [examples/ticket_templates.json](examples/ticket_templates.json)) and their defaults. |
+| `FRESH_MAX_WORKERS` | `8` | Requests in flight for paging and fan-outs. |
+| `FRESH_TIMEOUT`, `FRESH_MAX_ATTEMPTS` | `60`, `5` | Per-request timeout (seconds) and attempts. |
+| `FRESH_DEBUG`, `FRESH_DEBUG_FILE` | off | Debug output; see [Debugging](#debugging). |
+
+### Command line
+
+`freshservice <area> <action>`, with `--help` at every level. Output is JSON on stdout (tables for `--brief` and `publishers list`); logs, errors and a live progress line go to stderr. Bodies are Markdown (`--body`, `--body-file FILE`, or `-` for stdin) unless `--html` is given.
+
+```sh
+# Tickets, requests, changes
+freshservice tickets list --brief                                # id, subject, group, state
+freshservice tickets note 1234 --body-file update.md --attach report.pdf     # private by default
+freshservice tickets create --template ADVISORY --body-file advisory.md
+freshservice requests create 12 --requested-for user@example.com --field cf_model=MacBook
+freshservice changes create --subject "FW upgrade" --body-file plan.md --risk high --start 2026-12-01T20:00:00
+freshservice changes note 55 --body "Rollback plan" --attach rollback.md
+
+# Knowledge base, announcements, alerts, organisation
+freshservice articles list --mine --status draft
+freshservice articles create --title "VPN on macOS" --folder 20 --body-file vpn.md --tag vpn
+freshservice announcements create --title "Email outage" --body "Back by 14:00" --till 2026-11-13
+freshservice alerts list --severity critical --state open --since 2026-11-01 --brief
+freshservice org groups --brief
+
+# Assets, vendors, software
+freshservice assets devices --brief                              # id, name, type, vendor, product, state
+freshservice vendors get 11000177691 11001148623 --brief
+freshservice publishers list --search micro                      # publishers with software/install counts
+freshservice publishers software Mozilla                         # its software, devices per version
+freshservice software where --publisher Mozilla --name Firefox --version "<128" --brief
+freshservice --json tickets list --brief | jq '.[] | select(.state == "open")'
 ```
 
-Settings come from environment variables first and then from `.env` in the current directory. `FreshServiceSettings(_env_file="other.env")` or `FreshServiceSettings(domain=..., api_key=...)` overrides both.
+Global options go before the area: `--env-file`, `-o/--output FILE`, `--json`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines), `--progress/--no-progress`, `--debug`, `--debug-file FILE`, `-v`. Single deletes ask for confirmation unless `--yes` is given.
 
-## Library
+#### Clean-up: plan, review, `--apply`
+
+```sh
+# Assets with no product/vendor get vendor "Unknown" and product "Unknown (<type>)"...
+freshservice assets tag-unknown --type Firewall --type Switch --brief
+freshservice assets tag-unknown --type Firewall --type Switch --apply
+# ...and the real ones are set later on a selection.
+freshservice assets set-product-vendor --type Firewall --current-vendor Unknown --name "fgt-*" \
+    --vendor Fortinet --product "FortiGate 100F" --create-missing --apply
+
+# Duplicate vendors: software, asset vendor fields and contracts move to --into (--delete removes the sources).
+freshservice vendors merge "Microsoft Corporation" --into Microsoft --apply
+
+# Software within one vendor: installations and users move; sources become "ignored" (or --delete).
+freshservice software merge --vendor Google --into "Google Chrome" "Google Chrome 1*" --apply
+
+# Unused software (no installations, users or licenses), then publishers left without software.
+# A vendor still used by assets, contracts or purchase orders is kept. Safe to schedule.
+freshservice software cleanup --brief
+freshservice software cleanup --apply
+```
+
+### Library
 
 ```python
 from FreshService import (
     FreshServiceClient,
-    markdown_to_html,
     add_note,
-    create_change,
-    add_change_note,
-    create_service_request,
-    list_my_articles,
-    create_article,
-    where_installed,
-    summarise_installs,
-    plan_tag_unknown,
     apply_plan,
+    brief,
+    create_change,
+    list_publishers,
+    list_tickets,
+    markdown_to_html,
+    plan_software_cleanup,
+    where_installed,
 )
 
-with FreshServiceClient() as client:
-    add_note(client, 1234, markdown_to_html("**Patched**: see report"), attachments=["report.pdf"])
-
+with FreshServiceClient() as client:  # FRESH_* from the environment / .env
+    add_note(client, 1234, markdown_to_html("**Patched**"), attachments=["report.pdf"])
     change = create_change(
         client,
         subject="Upgrade FW firmware",
@@ -60,192 +149,82 @@ with FreshServiceClient() as client:
         email="me@example.com",
         planned_start_date="2026-12-01T20:00:00Z",
     )
-    add_change_note(client, change.id, "<p>Rollback plan attached.</p>", attachments=["rollback.md"])
 
-    create_service_request(
-        client,
-        item_display_id=12,
-        requested_for="user@example.com",
-        custom_fields={"cf_laptop_model": "MacBook Air"},
-    )
+    rows = brief(client, list_tickets(client))  # [{"id", "subject", "group", "state"}, ...]
+    publishers = list_publishers(client, name="micro")
+    old_firefox = where_installed(client, vendor="Mozilla", name="Firefox", version="<128")
 
-    mine = list_my_articles(client)  # FRESH_AGENT_ID, or agent_id=/email=
-
-    old = where_installed(client, vendor="Mozilla", name="Firefox", version="<128")
-    print(summarise_installs(old))  # devices per version
-
-    plan = plan_tag_unknown(client, ["Firewall", "Switch"])  # reads only
+    plan = plan_software_cleanup(client)  # reads only
     print(plan.model_dump_json(indent=2))
     apply_plan(client, plan)  # writes
 ```
 
-| Area | Functions |
-|---|---|
-| Tickets | `get_ticket`, `list_tickets`, `filter_tickets`, `create_ticket`, `create_ticket_from_template`, `update_ticket`, `delete_ticket`, `restore_ticket`, `list_ticket_fields`, `load_templates`, `ticket_from_template` |
-| Conversations | `add_note`, `reply`, `list_conversations`, `update_conversation`, `delete_conversation`, `delete_conversation_attachment`, `delete_ticket_attachment` |
-| Service requests | `list_catalog_categories`, `list_catalog_items`, `search_catalog_items`, `get_catalog_item`, `create_service_request`, `list_requested_items`, `update_requested_item` (notes: `add_note`) |
-| Changes | `get_change`, `list_changes`, `create_change`, `update_change`, `delete_change`, `list_change_fields`, `add_change_note`, `list_change_notes`, `get_change_note`, `update_change_note`, `delete_change_note` |
-| Solution articles | `list_categories`, `list_folders`, `list_articles`, `iter_all_articles`, `list_my_articles`, `search_articles`, `get_article`, `create_article`, `update_article`, `publish_article`, `send_article_for_approval`, `delete_article` |
-| Announcements | `list_announcements`, `get_announcement`, `create_announcement`, `update_announcement`, `delete_announcement` |
-| Alerts | `list_alerts`, `alert_query`, `get_alert`, `list_alert_notes` |
-| Org | `list_agents`, `get_agent`, `resolve_agent`, `list_groups`, `list_roles`, `list_departments`, `list_locations` |
-| Assets | `list_assets`, `list_devices`, `get_asset`, `update_asset`, `set_asset_product_vendor`, `delete_asset`, `assets_by_display_id`, `list_asset_types`, `asset_type_tree`, `asset_type_fields`, `product_vendor_fields` |
-| Products / vendors | `list_products`, `get/create/update/delete_product`, `list_vendors`, `get/create/update/delete_vendor`, `find_or_create_product`, `find_or_create_vendor`, `list_contracts` |
-| Software | `list_software`, `list_publishers`, `software_usage`, `version_rows`, `get/create/update/delete_software`, `list_installations`, `add_installation`, `remove_installations`, `list_software_users`, `add_software_users`, `remove_software_users`, `list_licenses`, `where_installed`, `summarise_installs`, `by_device` |
-| Clean-up | `plan_tag_unknown`, `plan_set_product_vendor`, `plan_vendor_merge`, `plan_software_merge`, `plan_software_delete`, `plan_software_cleanup`, `software_use`, `vendor_references`, `apply_plan` |
-| Views | `brief` (identifying fields of any listing), `render_table` |
+Every function takes the client first. Bodies are HTML (use `markdown_to_html()` for Markdown); attachments are file paths. The modules map to the areas above: `tickets`, `service_requests`, `changes`, `solutions`, `announcements`, `alerts`, `org`, `assets`, `catalog` (products, vendors), `software`, `maintenance` (plans), `views` (`brief`, `render_table`). For anything not wrapped, `client.get(path)`, `client.paginate(path, key)` and `client.post/put/delete` handle auth, retries and paging. Pass `progress=callback` to `FreshServiceClient` to follow long listings.
 
-Bodies (`description`, `body`, `body_html`) are HTML and sent as given; call `markdown_to_html()` first for Markdown. Attachments are local file paths; with any, the request goes as multipart. For anything not wrapped, `client.get(path)`, `client.paginate(path, key)`, `client.post/put/delete` give you raw JSON with auth, retries and paging handled.
+### Debugging
 
-### What the API does and doesn't offer
-
-- **"My articles" means "created by me".** Articles can only be listed per folder, and nothing filters by author, so `list_my_articles` walks every folder (one call each) and matches the creator (`agent_id`). There is no separate owner, and no `/agents/me`: set `FRESH_AGENT_ID`, or `FRESH_AGENT_EMAIL` if your role has "Manage Agents".
-- **Change notes can't hold attachments.** On notes, `attachments` is read-only. `add_change_note(attachments=...)` uploads the files to the change and links them in the note.
-- **Service requests take files only in the catalog item's own attachment fields.** Free attachments passed to `create_service_request` are added as a private note on the new request.
-- **There's no merge endpoint for vendors or software.** Merges are done client-side and aren't atomic. Every action reports done, failed or skipped, and a re-run picks up what's left. Moved installations lose their original `created_at`. Licenses can't be moved, so software with licenses is left alone. Discovery may re-create a merged-away entry on its next scan.
-- **Products don't link to vendors.** A product belongs to one asset type and has only a free-text manufacturer. An asset's vendor is its own field, `vendor_<type id>` in `type_fields`, like `product_<type id>`; `product_vendor_fields()` finds the real names.
-- **Assets can't be filtered by product or vendor**, and the asset filter stops at 1200 results (the library raises `FreshServiceTruncatedError` rather than return part of them). Type filters read the full asset listing, and product/vendor work also needs `type_fields`, which makes each page cost 3 API credits.
-- **Listings are paged at 100 per request, and there's no publishers endpoint.** A publisher is a vendor with software, so `publishers list` reads every vendor and every software entry (on a large account roughly 95 requests). The client fetches pages several at a time (1, 1, 2, 4, then up to `FRESH_MAX_WORKERS`, default 8), and vendors at the same time as software: a few seconds instead of half a minute.
-- **There's no fleet-wide installations list in the classic API** (`/itam/software_installations` exists only on accounts created after 31 March 2026). `where_installed` makes one call per matching software entry, in parallel (`FRESH_MAX_WORKERS`), and skips entries that report no installations.
-- **Alerts can't be created** through the API, and need the Alert Management feature. Agent roles are read-only. Ticket lists without `--since` cover only tickets created in the last 30 days.
-- **Rate limits are per account and per minute** (100 to 500 depending on plan, lower for listing tickets, assets and agents), shared with every other integration. The client honours `Retry-After` and pauses when `X-RateLimit-Remaining` runs low.
-
-## CLI
-
-Commands print JSON on stdout, except quick (`--brief`) listings and naturally flat ones (`publishers list`, `assets types`), which print a table. `--json` forces JSON everywhere, and `-o FILE` always writes JSON. Logs and errors go to stderr. Bodies are Markdown (`--body`, `--body-file FILE` or `-` for stdin) unless `--html` is given.
-
-**`--brief`** is available on every listing (tickets, requests items, changes, articles, announcements, alerts, org, assets, devices, products, vendors, software, publishers). It keeps only the identifying fields, with ids turned into names (group, vendor, product, asset type), and never makes per-record calls. If your role can't read a name listing, the id is shown instead:
-
-| Listing | `--brief` columns |
-|---|---|
-| tickets, changes | id, subject, group, state |
-| articles / announcements / alerts | id, title, state, folder_id / id, title, state / id, subject, severity, state, resource |
-| assets, devices | id, name, type, vendor, product, state |
-| products / vendors | id, name, type, manufacturer / id, name |
-| software, `publishers software` | id, name, publisher, installs, users (the API's counts) |
-| `publishers list` | id, name, software, installs |
-| `software where` | publisher, software, version, devices (one row per version) |
-| bulk commands (plans) | #, action, target, status, error |
+With debugging on, every request is logged: method, path, status, time, attempt, calls left this minute and Freshservice's request id. So are request bodies, retries and the full response of every failed request. Errors carry the request id too (`exc.request_id`, and `[request id ...]` in the message); quote it to Freshservice support. The API key is never logged, and bodies are cut at 2,000 characters.
 
 ```sh
-freshservice tickets note 1234 --body-file update.md --attach report.pdf     # private by default
-freshservice tickets create --template ADVISORY --body-file advisory.md
-freshservice tickets filter "status:2 AND priority:>2"
-freshservice requests items --search laptop
-freshservice requests create 12 --requested-for user@example.com --field cf_model=MacBook --attach quote.pdf
-freshservice changes create --subject "FW upgrade" --body-file plan.md --risk high --type standard --start 2026-12-01T20:00:00
-freshservice changes note 55 --body "Rollback plan" --attach rollback.md
-freshservice articles list --mine --status draft
-freshservice articles create --title "VPN on macOS" --folder 20 --body-file vpn.md --tag vpn
-freshservice announcements create --title "Email outage" --body "Back by 14:00" --till 2026-11-13
-freshservice alerts list --severity critical --state open --since 2026-11-01
-freshservice org groups
-freshservice assets devices
-freshservice tickets list --brief                        # id, subject, group, state as a table
-freshservice assets devices --brief                      # id, name, type, vendor, product, state
-freshservice publishers list --search goo                # publishers with software/install/user counts
-freshservice publishers software Mozilla                 # its software, with devices per version
-freshservice publishers software 11 --brief              # just names and the API's counts: fast
-freshservice software list --no-publisher --brief        # software with no (existing) publisher
-freshservice software where --publisher Mozilla --name Firefox --version "<128" --brief
-freshservice --json tickets list --brief | jq '.[] | select(.state == "open")'
+freshservice --debug tickets get 1234                       # on stderr, with a traceback on failure
+freshservice --debug-file fs-debug.log software cleanup --apply   # into a file only
 ```
 
-Global options: `--env-file`, `-o/--output FILE`, `--json`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines), `--progress/--no-progress`, `--debug`, `--debug-file FILE` and `-v`. On a terminal, a live status line on stderr shows how far a listing or fan-out has got (`applications: 3,400 records...`, `installations: 34/120...`). It is off when stderr is piped or logged, and the library itself never prints it; pass `progress=` to `FreshServiceClient` to get the same callbacks. Single deletes ask for confirmation unless `--yes` is given.
-
-### Clean-up: plan, review, `--apply`
-
-These commands print a plan (every write with before/after values) and change nothing until you run them again with `--apply`. Add `--brief` to see the actions as a table:
-
-```sh
-# 1. Firewalls and switches with no product/vendor get vendor "Unknown" and product "Unknown (<type>)".
-freshservice assets tag-unknown --type Firewall --type Switch
-freshservice assets tag-unknown --type Firewall --type Switch --apply
-
-# 2. Later, set the real ones on a selection, e.g. every Unknown-vendor firewall named fgt-*.
-freshservice assets set-product-vendor --type Firewall --current-vendor Unknown --name "fgt-*" \
-    --vendor Fortinet --product "FortiGate 100F" --create-missing --apply
-
-# Merge duplicate vendors: software publisher, asset vendor and contracts move to --into.
-freshservice vendors merge "Microsoft Corp*" "MS" --into "Microsoft"            # keeps the sources
-freshservice vendors merge "Microsoft Corp*" --into "Microsoft" --delete --apply
-
-# Merge software within one vendor: installations and users move, sources become "ignored".
-freshservice software merge --vendor Google --into "Google Chrome" "Google Chrome 1*"
-freshservice software merge --vendor Google --into "Google Chrome" "Google Chrome 1*" --delete --apply
-
-# Delete software entries with no installations, users or licenses.
-freshservice software delete --status none --apply
-
-# The full sweep: per publisher (and for software without one), delete every unused entry,
-# then every publisher left with no software, unless assets, contracts or purchase orders still use it.
-freshservice software cleanup --brief
-freshservice software cleanup --apply                        # safe to schedule
-freshservice software cleanup --publisher "OldCorp*" --apply # one publisher only
-freshservice software cleanup --orphan-vendors --apply       # also vendors with no software and no references
-```
-
-"Unused" means 0 installations, 0 users and 0 licenses (the contracts the API attaches to software; the API has no SLA link for software). Installation and user counts come from the software listing. Licenses take one call per entry, and only for entries with neither installations nor users. If assets, contracts or purchase orders can't be read, no vendor is deleted.
-
-Placeholder products are per asset type, because a product belongs to exactly one type. They share the `Unknown` prefix (`FRESH_UNKNOWN_LABEL`) so they can be filtered together.
-
-## Debugging
-
-Every request can be logged: method, path and query, status, time, attempt, how many API calls are left this minute, and Freshservice's `x-request-id`. Request bodies are logged too, multipart ones as field names and file names, as are retries and the full response of every failed request. Errors also carry the request id (`exc.request_id`, and `[request id ...]` in the message), which is what Freshservice support asks for. The API key is never logged, and bodies are cut at 2,000 characters. Ticket text can still be personal, so treat debug files like the data itself.
-
-```sh
-freshservice --debug tickets get 1234                 # debug lines on stderr, with a traceback on failure
-freshservice --debug-file fs-debug.log software cleanup --apply   # into a file; the terminal stays clean
-FRESH_DEBUG=true freshservice publishers list         # or FRESH_DEBUG / FRESH_DEBUG_FILE in .env
-```
-
-When the library is used from another program:
+From another program, the library logs to the standard `logging` loggers `FreshService` (retries, fallbacks, maintenance actions) and `FreshService.http` (each request):
 
 ```python
 import logging
+
 from FreshService import FreshServiceClient, enable_debug
 
-# The app already configures logging: just open the library's loggers up.
-logging.getLogger("FreshService").setLevel(logging.DEBUG)  # everything
-logging.getLogger("FreshService.http").setLevel(logging.INFO)  # ...but no per-request lines
-
-# No logging set up: print it to stderr and/or append it to a file.
-enable_debug(file="fs-debug.log")
-client = FreshServiceClient(debug=True)  # the same; so does FRESH_DEBUG=true / FRESH_DEBUG_FILE
+logging.getLogger("FreshService").setLevel(logging.DEBUG)  # if the app already configures logging
+enable_debug(file="fs-debug.log")  # if it doesn't: stderr and/or a file
+client = FreshServiceClient(debug=True)  # the same; so do FRESH_DEBUG / FRESH_DEBUG_FILE
 ```
 
-`FreshService` logs retries, rate-limit pauses, names that fell back to ids and every maintenance action as it is applied. `FreshService.http` logs each request. A connection error or timeout on a GET, PUT or DELETE is retried with backoff and logged. A POST is never retried, because it may already have gone through.
+Connection errors and timeouts on GET, PUT and DELETE are retried with backoff; a POST is never retried, because it may already have gone through.
 
-## Development
+## Development and testing
 
-[devenv](https://devenv.sh) provides Python and [uv](https://docs.astral.sh/uv/), and runs `uv sync` when you enter the shell (direnv does this automatically via `.envrc`):
+[devenv](https://devenv.sh) provides Python 3.14 and [uv](https://docs.astral.sh/uv/), installs the git hooks (ruff), and runs `uv sync` when you enter the shell; with direnv this happens on `cd` (via `.envrc`).
 
 ```sh
-devenv shell
-uv run pytest                    # unit tests, no network
-uv run pytest -m live -rs        # read-only calls to the account in your .env
-uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
-devenv test                      # all of the above except live
-uv build                         # wheel + sdist in dist/
+devenv shell                      # or let direnv load it
+uv run freshservice --help        # the CLI from your working copy (installed in editable mode)
 ```
 
-Dependencies are managed with `uv add` / `uv remove`. Commit `uv.lock`.
+| Command | What it checks |
+|---|---|
+| `uv run pytest` | Unit tests against a mocked API (`responses`); no network, no `.env` needed. |
+| `uv run pytest -m live -rs` | Read-only calls to the account in your `.env`; endpoints your role may not use are reported as skipped. Never writes. |
+| `uv run ruff check . && uv run ruff format --check .` | Lint and formatting (also the Python blocks in this README). |
+| `uv run mypy src tests` | Strict type checks. |
+| `devenv test` | All of the above except live, as CI runs them. |
 
-### Releases
+- **Tests** live in `tests/`, one file per area; `tests/conftest.py` has the mocked client and helpers (`pages()` serves a paged endpoint the way Freshservice does). The mock refuses any unregistered request, so a test that registers only GETs also proves nothing was written.
+- **Writes against the real API** are not in the automatic tests. Try them on a test ticket, change or article, and run clean-up commands without `--apply` first.
+- **Dependencies:** `uv add` / `uv remove`, and commit `uv.lock`. [Dependabot](.github/dependabot.yml) opens grouped PRs against `develop` every Monday (minor/patch together, major separately); it can't update `devenv.lock`, so run `devenv update` for that.
+- **CI** ([ci.yml](.github/workflows/ci.yml)) runs lint, types and tests on Python 3.12 and 3.14 for every PR and for pushes to `main`.
 
-Packages are built only from tags. Bump the version, commit, and push a matching `v` tag:
+## Releasing a new version
+
+Work happens on `develop`; `main` only moves through pull requests. A release is a version bump and a `v` tag on `develop`; the tag builds the release, and a PR brings `main` up to date.
 
 ```sh
-uv version --bump minor          # or patch / major; updates pyproject.toml and uv.lock
+git switch develop && git pull                           # 1. start from the latest develop
+devenv test                                              # 2. everything green
+uv version --bump minor                                  # 3. or patch / major (updates pyproject.toml and uv.lock)
 git commit -am "Release $(uv version --short)"
-git tag "v$(uv version --short)" && git push origin main --tags
+git tag "v$(uv version --short)"
+git push origin develop "v$(uv version --short)"         # 4. push the branch and that one tag
 ```
 
-The [release workflow](.github/workflows/release.yml) runs the CI checks and fails if the tag doesn't match the version in `pyproject.toml`. It then builds the wheel and sdist and attaches them to a GitHub release with generated notes. Other projects can then pin the tag (`...FreshServiceLibrary@v1.0.0`).
+5. Pushing the tag starts the [release workflow](.github/workflows/release.yml): it runs the CI checks, fails if the tag doesn't match `version` in `pyproject.toml`, builds the wheel and sdist, smoke-tests `freshservice --version`, and publishes a GitHub release with generated notes.
+6. Open a pull request `develop` → `main` and merge it.
+7. Bring your local `main` along without switching to it: `git fetch origin main:main`.
 
-### Dependency updates
+Then point consumers at the new tag (`...FreshServiceLibrary@vX.Y.Z`) and run `uv lock --upgrade-package freshservice-library` there.
 
-[Dependabot](.github/dependabot.yml) checks the uv dependencies and GitHub Actions every Monday at 23:00 (Europe/Oslo). It opens one grouped PR for minor and patch updates and one for major updates. [CI](.github/workflows/ci.yml) runs lint, type checks and tests on Python 3.12 and 3.14 for every PR. Merging stays manual.
-
-- Security-alert PRs are switched on in the repository settings (Code security → Dependabot security updates), not in the config file.
-- Dependabot can't update `devenv.lock` (Nix). Run `devenv update` for that.
+- **Patch** for fixes, **minor** for new commands or options, **major** when existing commands, output or function signatures change.
+- Never push your local `main`, and don't force-push: if git rejects a push to `main`, your copy is behind, and the PR is the way to update it. `git push --tags` pushes every local tag; pushing the one tag by name, as above, avoids surprises.
+- A wrong tag that hasn't been released yet can be removed with `git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`. Once a release exists, publish a new patch version instead.
