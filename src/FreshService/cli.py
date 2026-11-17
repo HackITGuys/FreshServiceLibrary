@@ -38,7 +38,7 @@ from FreshService import announcements as announcements_api
 from FreshService import assets as assets_api
 from FreshService import catalog as catalog_api
 from FreshService import changes as changes_api
-from FreshService import maintenance, views
+from FreshService import logs, maintenance, views
 from FreshService import org as org_api
 from FreshService import service_requests as requests_api
 from FreshService import software as software_api
@@ -126,6 +126,7 @@ class State:
     json_output: bool = False
     audit_log: Path | None = None
     progress: StderrProgress | None = None
+    log_handler: logging.Handler | None = field(default=None, repr=False)
     _client: FreshServiceClient | None = field(default=None, repr=False)
 
     @property
@@ -135,6 +136,9 @@ class State:
                 FreshServiceSettings(_env_file=self.env_file) if self.env_file else FreshServiceSettings()
             )
             self._client = FreshServiceClient(settings, audit_log=self.audit_log, progress=self.progress)
+            if settings.debug and self.log_handler is not None:  # FRESH_DEBUG: show it like --debug
+                self.log_handler.setLevel(logging.DEBUG)
+                self.log_handler.setFormatter(logging.Formatter(logs.DEBUG_FORMAT))
         return self._client
 
 
@@ -325,6 +329,7 @@ class Group(click.Group):
         try:
             return super().invoke(ctx)
         except (FreshServiceError, ValueError, requests.RequestException) as exc:
+            log.debug("Command failed", exc_info=True)
             raise click.ClickException(str(exc)) from exc
 
 
@@ -352,7 +357,17 @@ class Group(click.Group):
     default=None,
     help="A live status line on stderr while fetching (default: on when stderr is a terminal).",
 )
-@click.option("-v", "--verbose", count=True, help="-v for more detail, -vv for HTTP details.")
+@click.option("-v", "--verbose", count=True, help="-v more detail, -vv debug output, -vvv also urllib3.")
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Debug output on stderr: every request, retries, failed responses (also FRESH_DEBUG=true).",
+)
+@click.option(
+    "--debug-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Append the debug output to this file instead of showing it (also FRESH_DEBUG_FILE).",
+)
 @click.version_option(package_name="freshservice-library")
 @click.pass_context
 def main(
@@ -364,20 +379,32 @@ def main(
     audit_log: Path | None,
     progress: bool | None,
     verbose: int,
+    debug: bool,
+    debug_file: Path | None,
 ) -> None:
     """Freshservice API: tickets, requests, changes, articles, announcements, alerts, assets, software."""
     show_progress = sys.stderr.isatty() if progress is None else progress
     reporter = StderrProgress() if show_progress else None
     handler = _ProgressAwareHandler(reporter)
-    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
-    logging.basicConfig(
-        level=max(logging.DEBUG, logging.WARNING - 10 * verbose), handlers=[handler], force=True
+    terminal_level = logging.DEBUG if debug else max(logging.DEBUG, logging.WARNING - 10 * verbose)
+    handler.setLevel(terminal_level)
+    handler.setFormatter(
+        logging.Formatter(
+            logs.DEBUG_FORMAT if terminal_level == logging.DEBUG else "%(levelname)s %(message)s"
+        )
     )
+    logging.basicConfig(level=terminal_level, handlers=[handler], force=True)
+    # urllib3's connection lines repeat FreshService.http's; only -vvv shows them.
+    logging.getLogger("urllib3").setLevel(logging.DEBUG if verbose >= 3 else logging.WARNING)
+    if debug or debug_file:
+        # The terminal handler's level decides what shows on screen; the file gets everything.
+        logs.enable_debug(file=debug_file)
     if not isinstance(ctx.obj, State):
         ctx.obj = State()
     state = ctx.obj
     state.env_file, state.output, state.audit_log = env_file, output, audit_log
     state.compact, state.json_output, state.progress = compact, json_output, reporter
+    state.log_handler = handler
     if reporter is not None:
         if state._client is not None:  # a client handed in (tests): report through it too
             state._client.progress = reporter

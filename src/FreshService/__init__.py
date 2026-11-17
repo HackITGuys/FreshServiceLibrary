@@ -92,6 +92,7 @@ from FreshService.formatting import (
     markdown_file_to_html,
     markdown_to_html,
 )
+from FreshService.logs import disable_debug, enable_debug
 from FreshService.maintenance import (
     SoftwareUse,
     apply_plan,
@@ -349,6 +350,8 @@ __all__ = [
     "delete_ticket",
     "delete_ticket_attachment",
     "delete_vendor",
+    "disable_debug",
+    "enable_debug",
     "filter_tickets",
     "find_or_create_product",
     "find_or_create_vendor",

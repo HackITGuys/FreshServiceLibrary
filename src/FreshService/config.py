@@ -53,6 +53,10 @@ class FreshServiceSettings(BaseSettings):
     """Parallel requests: pages of one listing, and fan-outs (installations per software,
     assets by id). Every request still counts against the account's per-minute limit."""
 
+    debug: bool = False
+    """Log every request, and the response body of failed ones, to stderr (see logs.py)."""
+    debug_file: Path | None = None
+    """Also append that debug log to this file (implies debug)."""
     agent_id: int | None = None
     """The agent that `--mine` / list_my_articles() means (see your profile URL, /agents/<id>).
     There is no /agents/me, and looking an agent up by email needs the "Manage Agents" role."""

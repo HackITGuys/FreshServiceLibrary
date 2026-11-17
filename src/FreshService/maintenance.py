@@ -43,6 +43,7 @@ from FreshService.client import (
     FreshServiceError,
     FreshServiceNotFoundError,
 )
+from FreshService.logs import log
 from FreshService.matching import is_glob, name_matches, text_matches, version_key
 from FreshService.models import (
     Asset,
@@ -112,6 +113,7 @@ def apply_plan(client: FreshServiceClient, plan: MaintenancePlan) -> Maintenance
         blocked = [index for index in action.requires if result.actions[index].status != "done"]
         if blocked:
             action.status, action.error = "skipped", f"depends on actions {blocked}, which did not succeed"
+            log.debug("skipped %s %s: %s", action.action, action.target, action.error)
             continue
         try:
             path = _substitute(action.path, refs)
@@ -119,6 +121,7 @@ def apply_plan(client: FreshServiceClient, plan: MaintenancePlan) -> Maintenance
             params = _substitute(action.params, refs)
         except KeyError as exc:
             action.status, action.error = "skipped", f"needs the id of {exc.args[0]!r}, which was not created"
+            log.debug("skipped %s %s: %s", action.action, action.target, action.error)
             continue
         try:
             if action.method == "DELETE":
@@ -131,8 +134,10 @@ def apply_plan(client: FreshServiceClient, plan: MaintenancePlan) -> Maintenance
                         raise FreshServiceError(f"{action.method} {path} returned no id for {action.ref!r}")
                     refs[action.ref] = action.result_id = int(new_id)
             action.status = "done"
+            log.debug("done %s %s (%s %s)", action.action, action.target, action.method, path)
         except FreshServiceError as exc:
             action.status, action.error = "failed", str(exc)
+            log.warning("failed %s %s: %s", action.action, action.target, exc)
     result.applied = True
     for status in ("done", "failed", "skipped"):
         result.summary[status] = sum(1 for action in result.actions if action.status == status)

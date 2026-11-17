@@ -40,8 +40,7 @@ import requests
 from pydantic_core import to_jsonable_python
 
 from FreshService.config import FreshServiceSettings
-
-log = logging.getLogger("FreshService")
+from FreshService.logs import clip, enable_debug, http_log, log
 
 RETRY_STATUSES = (429, 502, 503, 504)
 """Retried on every method. A POST is only retried on 429, which the server rejects
@@ -66,14 +65,24 @@ Attachments = Iterable[str | Path]
 
 
 class FreshServiceError(RuntimeError):
-    """An API call failed. `status` is the HTTP status, `errors` the API's error list."""
+    """An API call failed. `status` is the HTTP status, `errors` the API's error list,
+    `request_id` Freshservice's x-request-id (quote it to their support), `body` the raw
+    response text."""
 
     def __init__(
-        self, message: str, *, status: int | None = None, errors: list[dict[str, Any]] | None = None
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        request_id: str | None = None,
+        body: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.errors = errors or []
+        self.request_id = request_id
+        self.body = body
 
 
 class FreshServiceConfigError(FreshServiceError):
@@ -185,8 +194,9 @@ class FreshServiceClient:
             ticket = get_ticket(client, 1234)
 
     Thread-safe for the fan-outs this library does (parallel GETs through one session).
-    Pass `audit_log` to append every POST/PUT/DELETE to a JSON-lines file, and `progress`
-    (label, done, total) to hear how a long listing or fan-out is getting on.
+    Pass `audit_log` to append every POST/PUT/DELETE to a JSON-lines file, `progress`
+    (label, done, total) to hear how a long listing or fan-out is getting on, and
+    debug=True (or FRESH_DEBUG / FRESH_DEBUG_FILE) for request-level logging (see logs.py).
     """
 
     def __init__(
@@ -196,8 +206,11 @@ class FreshServiceClient:
         *,
         audit_log: Path | None = None,
         progress: ProgressHook | None = None,
+        debug: bool = False,
     ) -> None:
         self.settings = settings or FreshServiceSettings()
+        if debug or self.settings.debug or self.settings.debug_file:
+            enable_debug(file=self.settings.debug_file)
         missing = self.settings.missing()
         if missing:
             raise FreshServiceConfigError(f"{' and '.join(missing)} not set (environment or .env)")
@@ -281,26 +294,73 @@ class FreshServiceClient:
         data: list[tuple[str, str]] | None = None,
         files: list[FileField] | None = None,
     ) -> requests.Response:
-        """One call to /api/v2{path}. Retries 429 (Retry-After) and 502-504; raises on >= 400."""
+        """One call to /api/v2{path}. Retries 429 (Retry-After) and 502-504, and connection
+        errors and timeouts on GET/PUT/DELETE; raises on >= 400."""
         url = self.settings.api_root + path
-        retryable = RETRY_STATUSES if method in ("GET", "PUT", "DELETE") else (429,)
+        idempotent = method in ("GET", "PUT", "DELETE")
+        retryable = RETRY_STATUSES if idempotent else (429,)
+        query = f"?{'&'.join(f'{k}={v}' for k, v in params.items())}" if params else ""
+        if http_log.isEnabledFor(logging.DEBUG) and (json_body is not None or data or files):
+            sent = json_body if json_body is not None else dict(data or [])
+            names = [file[1][0] for file in files or []]
+            http_log.debug(
+                "%s %s body: %s%s", method, path, clip(sent), f" attachments: {names}" if names else ""
+            )
         response: requests.Response | None = None
 
         for attempt in range(1, self.settings.max_attempts + 1):
-            response = self.session.request(
+            started = time.monotonic()
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    params=dict(params) if params else None,
+                    json=json_body,
+                    data=data,
+                    files=files,
+                    headers={"Accept": "application/json"},
+                    timeout=self.settings.timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                http_log.debug(
+                    "%s %s%s attempt %d failed after %.2fs: %s: %s",
+                    method,
+                    path,
+                    query,
+                    attempt,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                    exc,
+                )
+                if idempotent and attempt < self.settings.max_attempts:
+                    delay = float(min(2**attempt, 60))
+                    log.info("%s on %s %s, retrying in %.0fs", type(exc).__name__, method, path, delay)
+                    time.sleep(delay)
+                    continue
+                log.debug("%s %s gave up after %d attempt(s): %s", method, path, attempt, exc)
+                raise
+            http_log.debug(
+                "%s %s%s -> %s in %.2fs (attempt %d, %s calls left this minute, request id %s)",
                 method,
-                url,
-                params=dict(params) if params else None,
-                json=json_body,
-                data=data,
-                files=files,
-                headers={"Accept": "application/json"},
-                timeout=self.settings.timeout,
+                path,
+                query,
+                response.status_code,
+                time.monotonic() - started,
+                attempt,
+                response.headers.get("X-RateLimit-Remaining", "?"),
+                response.headers.get("x-request-id", "-"),
             )
             self._pace(response)
             if response.status_code in retryable and attempt < self.settings.max_attempts:
                 delay = _retry_delay(response, attempt)
-                log.info("HTTP %s on %s %s, retrying in %.0fs", response.status_code, method, path, delay)
+                log.info(
+                    "HTTP %s on %s %s, retrying in %.0fs (request id %s)",
+                    response.status_code,
+                    method,
+                    path,
+                    delay,
+                    response.headers.get("x-request-id", "-"),
+                )
                 time.sleep(delay)
                 continue
             break
@@ -309,14 +369,23 @@ class FreshServiceClient:
         if method != "GET":
             self._audit(method, path, params, json_body if json_body is not None else data, files, response)
         if response.status_code >= 400:
-            raise self._error(method, path, response)
+            error = self._error(method, path, response)
+            http_log.debug(
+                "%s %s%s failed: HTTP %s, request id %s, response: %s",
+                method,
+                path,
+                query,
+                response.status_code,
+                error.request_id or "-",
+                clip(response.text),
+            )
+            raise error
         return response
 
     def _pace(self, response: requests.Response) -> None:
         remaining = response.headers.get("X-RateLimit-Remaining", "").strip()
         if not remaining.isdigit():
             return
-        log.debug("rate limit: %s of %s left", remaining, response.headers.get("X-RateLimit-Total", "?"))
         if int(remaining) <= LOW_RATE_LIMIT and response.status_code != 429:
             log.info("only %s API calls left this minute; pausing %.0fs", remaining, PACE_SECONDS)
             time.sleep(PACE_SECONDS)
@@ -347,22 +416,25 @@ class FreshServiceClient:
             for error in errors
         )
         status = response.status_code
+        request_id = response.headers.get("x-request-id")
         text = f"{method} /api/v2{path} returned HTTP {status}"
         if message:
             text += f": {message}"
         if details and details != message:
             text += f" - {details}"
         if status == 401:
-            return FreshServiceAuthError(text + ". Check FRESH_API_KEY and FRESH_DOMAIN.", status=status)
-        if status == 403:
-            return FreshServiceAuthError(
-                text + ". The API key's agent lacks the permission, or the plan lacks the feature.",
-                status=status,
-                errors=errors,
-            )
-        if status == 404:
-            return FreshServiceNotFoundError(text, status=status, errors=errors)
-        return FreshServiceError(text, status=status, errors=errors)
+            text += ". Check FRESH_API_KEY and FRESH_DOMAIN."
+            cls: type[FreshServiceError] = FreshServiceAuthError
+        elif status == 403:
+            text += ". The API key's agent lacks the permission, or the plan lacks the feature."
+            cls = FreshServiceAuthError
+        elif status == 404:
+            cls = FreshServiceNotFoundError
+        else:
+            cls = FreshServiceError
+        if request_id:
+            text += f" [request id {request_id}]"
+        return cls(text, status=status, errors=errors, request_id=request_id, body=response.text)
 
     def _audit(
         self,
@@ -484,6 +556,9 @@ class FreshServiceClient:
                 if isinstance(outcome, BaseException):
                     raise outcome
                 records, has_next = outcome
+                http_log.debug(
+                    "%s page %d: %d records%s", path, number, len(records), ", more" if has_next else ""
+                )
                 if not records:
                     return
                 marker = (json.dumps(records[0], sort_keys=True), json.dumps(records[-1], sort_keys=True))
@@ -513,6 +588,7 @@ class FreshServiceClient:
                 records = _as_list(extract(response.json(), key, path), path) if response.content else []
                 return records, self._has_next(response, len(records), size)
             except Exception as exc:  # handed back; paginate raises it only if the page is needed
+                http_log.debug("%s page %d failed (raised only if the page is needed): %s", path, number, exc)
                 return exc
 
         if len(numbers) == 1:

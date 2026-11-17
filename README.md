@@ -151,7 +151,7 @@ freshservice software where --publisher Mozilla --name Firefox --version "<128" 
 freshservice --json tickets list --brief | jq '.[] | select(.state == "open")'
 ```
 
-Global options: `--env-file`, `-o/--output FILE`, `--json`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines), `--progress/--no-progress` and `-v`. On a terminal, a live status line on stderr shows how far a listing or fan-out has got (`applications: 3,400 records...`, `installations: 34/120...`). It is off when stderr is piped or logged, and the library itself never prints it; pass `progress=` to `FreshServiceClient` to get the same callbacks. Single deletes ask for confirmation unless `--yes` is given.
+Global options: `--env-file`, `-o/--output FILE`, `--json`, `--compact`, `--audit-log FILE` (every POST/PUT/DELETE as JSON lines), `--progress/--no-progress`, `--debug`, `--debug-file FILE` and `-v`. On a terminal, a live status line on stderr shows how far a listing or fan-out has got (`applications: 3,400 records...`, `installations: 34/120...`). It is off when stderr is piped or logged, and the library itself never prints it; pass `progress=` to `FreshServiceClient` to get the same callbacks. Single deletes ask for confirmation unless `--yes` is given.
 
 ### Clean-up: plan, review, `--apply`
 
@@ -188,6 +188,33 @@ freshservice software cleanup --orphan-vendors --apply       # also vendors with
 "Unused" means 0 installations, 0 users and 0 licenses (the contracts the API attaches to software; the API has no SLA link for software). Installation and user counts come from the software listing. Licenses take one call per entry, and only for entries with neither installations nor users. If assets, contracts or purchase orders can't be read, no vendor is deleted.
 
 Placeholder products are per asset type, because a product belongs to exactly one type. They share the `Unknown` prefix (`FRESH_UNKNOWN_LABEL`) so they can be filtered together.
+
+## Debugging
+
+Every request can be logged: method, path and query, status, time, attempt, how many API calls are left this minute, and Freshservice's `x-request-id`. Request bodies are logged too, multipart ones as field names and file names, as are retries and the full response of every failed request. Errors also carry the request id (`exc.request_id`, and `[request id ...]` in the message), which is what Freshservice support asks for. The API key is never logged, and bodies are cut at 2,000 characters. Ticket text can still be personal, so treat debug files like the data itself.
+
+```sh
+freshservice --debug tickets get 1234                 # debug lines on stderr, with a traceback on failure
+freshservice --debug-file fs-debug.log software cleanup --apply   # into a file; the terminal stays clean
+FRESH_DEBUG=true freshservice publishers list         # or FRESH_DEBUG / FRESH_DEBUG_FILE in .env
+```
+
+When the library is used from another program:
+
+```python
+import logging
+from FreshService import FreshServiceClient, enable_debug
+
+# The app already configures logging: just open the library's loggers up.
+logging.getLogger("FreshService").setLevel(logging.DEBUG)  # everything
+logging.getLogger("FreshService.http").setLevel(logging.INFO)  # ...but no per-request lines
+
+# No logging set up: print it to stderr and/or append it to a file.
+enable_debug(file="fs-debug.log")
+client = FreshServiceClient(debug=True)  # the same; so does FRESH_DEBUG=true / FRESH_DEBUG_FILE
+```
+
+`FreshService` logs retries, rate-limit pauses, names that fell back to ids and every maintenance action as it is applied. `FreshService.http` logs each request. A connection error or timeout on a GET, PUT or DELETE is retried with backoff and logged. A POST is never retried, because it may already have gone through.
 
 ## Development
 
